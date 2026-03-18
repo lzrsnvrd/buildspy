@@ -266,6 +266,9 @@ async fn main() -> Result<()> {
     // Cache: PID → process name (comm), used to filter build-tool opens.
     let mut pid_to_comm: std::collections::HashMap<u32, String> =
         std::collections::HashMap::new();
+    // Cache: PID → working directory at spawn time, used to resolve relative paths.
+    let mut pid_to_cwd: std::collections::HashMap<u32, PathBuf> =
+        std::collections::HashMap::new();
 
     // Seed the watcher with the direct child PID.
     let _ = new_pid_tx.send(child_pid);
@@ -297,13 +300,16 @@ async fn main() -> Result<()> {
                         let _ = pf.insert(pid, 1u8, 0);
                     }
                 }
-                // Read process name while the process is still alive.
+                // Read process name and cwd while the process is still alive.
                 let comm = std::fs::read_to_string(
                     format!("/proc/{pid}/comm"))
                     .unwrap_or_default();
                 let comm = comm.trim().to_string();
                 log::debug!("proc-watcher: tracking PID {} ({})", pid, comm);
                 pid_to_comm.insert(pid, comm);
+                if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                    pid_to_cwd.insert(pid, cwd);
+                }
             }
             // Build process finished.
             result = child.wait() => {
@@ -345,7 +351,11 @@ async fn main() -> Result<()> {
             continue;
         }
         if resolver::is_relevant(&raw) {
-            let normalized = resolver::normalize(&raw, &project_dir);
+            let cwd = pid_to_cwd
+                .get(&opener_pid)
+                .map(PathBuf::as_path)
+                .unwrap_or(&project_dir);
+            let normalized = resolver::normalize(&raw, cwd);
             unique_paths.insert(normalized.to_string_lossy().to_string());
         }
     }

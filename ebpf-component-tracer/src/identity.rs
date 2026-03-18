@@ -2,11 +2,15 @@
 //!
 //! Given a file path:
 //!  * **System paths** (`/usr/`, `/lib/`, …) → query the local package manager
-//!    (`dpkg -S`, `pacman -Qo`, or `rpm -qf`) and return package name + version.
+//!    and return package name + version.
 //!  * **Local paths** → compute a SHA-256 hash as a stable identifier.
 //!
-//! All package-manager look-ups are cached in memory so that the same shared
-//! library does not trigger hundreds of subprocess invocations.
+//! For dpkg systems the database is read directly from
+//! `/var/lib/dpkg/info/*.list` and `/var/lib/dpkg/status` at startup,
+//! building an in-memory index.  Subsequent lookups are O(1) with no
+//! subprocess overhead.  pacman and rpm fall back to subprocess calls.
+//!
+//! All look-ups are cached so the same path is never resolved twice.
 
 use std::{
     collections::HashMap,
@@ -70,20 +74,157 @@ fn detect_package_manager() -> PackageManager {
 }
 
 // ---------------------------------------------------------------------------
+// DpkgIndex – in-memory dpkg database
+// ---------------------------------------------------------------------------
+
+/// In-memory index built from `/var/lib/dpkg/info/*.list` and
+/// `/var/lib/dpkg/status`.  Replaces subprocess calls to `dpkg -S` /
+/// `dpkg-query -W` with O(1) HashMap lookups.
+struct DpkgIndex {
+    /// Absolute file path → "pkgname:arch" key.
+    /// For Architecture: all packages the key has no arch suffix
+    /// (e.g. "nlohmann-json3-dev"), matching the .list filename stem.
+    path_to_pkg: HashMap<String, String>,
+
+    /// "pkgname:arch" (or bare "pkgname" for arch:all) → version string.
+    pkg_to_version: HashMap<String, String>,
+}
+
+impl DpkgIndex {
+    /// Build the index.  Returns `None` if the dpkg DB cannot be read
+    /// (non-dpkg system, container without package DB, …).
+    fn load() -> Option<Self> {
+        let pkg_to_version = Self::load_versions().ok()?;
+        let path_to_pkg = Self::load_paths().ok()?;
+        log::debug!(
+            "DpkgIndex: {} paths, {} packages",
+            path_to_pkg.len(),
+            pkg_to_version.len(),
+        );
+        Some(Self { path_to_pkg, pkg_to_version })
+    }
+
+    /// Parse `/var/lib/dpkg/status` into a map of pkg key → version.
+    ///
+    /// Key format:
+    ///   - `"libflac-dev:amd64"` for architecture-specific packages
+    ///   - `"nlohmann-json3-dev"` (no suffix) for `Architecture: all`
+    fn load_versions() -> std::io::Result<HashMap<String, String>> {
+        let content = fs::read_to_string("/var/lib/dpkg/status")?;
+        let mut map = HashMap::new();
+
+        let mut pkg = String::new();
+        let mut arch = String::new();
+        let mut version = String::new();
+
+        for line in content.lines() {
+            if line.is_empty() {
+                // End of stanza – commit if we have all three fields.
+                if !pkg.is_empty() && !version.is_empty() {
+                    let key = if arch.is_empty() || arch == "all" {
+                        pkg.clone()
+                    } else {
+                        format!("{}:{}", pkg, arch)
+                    };
+                    map.insert(key, version.clone());
+                }
+                pkg.clear();
+                arch.clear();
+                version.clear();
+            } else if let Some(v) = line.strip_prefix("Package: ") {
+                pkg = v.to_string();
+            } else if let Some(v) = line.strip_prefix("Architecture: ") {
+                arch = v.to_string();
+            } else if let Some(v) = line.strip_prefix("Version: ") {
+                version = v.to_string();
+            }
+        }
+        // Last stanza may not be followed by a blank line.
+        if !pkg.is_empty() && !version.is_empty() {
+            let key = if arch.is_empty() || arch == "all" {
+                pkg
+            } else {
+                format!("{}:{}", pkg, arch)
+            };
+            map.insert(key, version);
+        }
+
+        Ok(map)
+    }
+
+    /// Read every `*.list` file under `/var/lib/dpkg/info/` and build a
+    /// path → pkg-key map.
+    ///
+    /// `.list` filenames:
+    ///   - `libflac-dev:amd64.list` → key `"libflac-dev:amd64"`
+    ///   - `nlohmann-json3-dev.list` → key `"nlohmann-json3-dev"`
+    fn load_paths() -> std::io::Result<HashMap<String, String>> {
+        let info_dir = Path::new("/var/lib/dpkg/info");
+        let mut map = HashMap::new();
+
+        for entry in fs::read_dir(info_dir)?.flatten() {
+            let fpath = entry.path();
+            if fpath.extension().and_then(|e| e.to_str()) != Some("list") {
+                continue;
+            }
+            let stem = match fpath.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let Ok(content) = fs::read_to_string(&fpath) else {
+                continue;
+            };
+            for line in content.lines() {
+                // Skip the dpkg root-placeholder "/." and blank lines.
+                if line.is_empty() || line == "/." {
+                    continue;
+                }
+                if line.starts_with('/') {
+                    map.insert(line.to_string(), stem.clone());
+                }
+            }
+        }
+
+        Ok(map)
+    }
+
+    /// Look up `path` and return `(pkg_name, version)` if found.
+    fn lookup(&self, path: &str) -> Option<(String, String)> {
+        let pkg_key = self.path_to_pkg.get(path)?;
+        // Strip arch suffix for the human-readable name ("libflac-dev:amd64" → "libflac-dev").
+        let pkg_name = pkg_key.split(':').next().unwrap_or(pkg_key).to_string();
+        let version = self.pkg_to_version
+            .get(pkg_key.as_str())
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        Some((pkg_name, version))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IdentityEngine
 // ---------------------------------------------------------------------------
 
 /// Thread-safe engine that resolves file paths to component identities.
 pub struct IdentityEngine {
     pkg_manager: PackageManager,
+    /// Populated at startup for dpkg systems; None on pacman/rpm/unknown.
+    dpkg_index: Option<DpkgIndex>,
     /// Cache: absolute path → resolved package info (or None if not found).
     cache: Mutex<HashMap<String, Option<(String, String)>>>,
 }
 
 impl IdentityEngine {
     pub fn new() -> Self {
+        let pkg_manager = detect_package_manager();
+        let dpkg_index = if pkg_manager == PackageManager::Dpkg {
+            DpkgIndex::load()
+        } else {
+            None
+        };
         Self {
-            pkg_manager: detect_package_manager(),
+            pkg_manager,
+            dpkg_index,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -104,7 +245,7 @@ impl IdentityEngine {
     fn identify_system(&self, path: &Path) -> ComponentIdentity {
         let key = path.to_string_lossy().to_string();
 
-        // Check cache first (read lock).
+        // Check cache first.
         {
             let cache = self.cache.lock().unwrap();
             if let Some(entry) = cache.get(&key) {
@@ -118,10 +259,8 @@ impl IdentityEngine {
             }
         }
 
-        // Miss – query the package manager.
         let result = self.query_package_manager(&key);
 
-        // Store in cache (write lock).
         {
             let mut cache = self.cache.lock().unwrap();
             cache.insert(key, result.clone());
@@ -133,8 +272,6 @@ impl IdentityEngine {
         }
     }
 
-    /// Returns `Some((name, version))` or `None` if the path is not owned by
-    /// any known package.
     fn query_package_manager(&self, path: &str) -> Option<(String, String)> {
         match self.pkg_manager {
             PackageManager::Dpkg => self.query_dpkg(path),
@@ -147,19 +284,39 @@ impl IdentityEngine {
     // ---- dpkg ---------------------------------------------------------------
 
     fn query_dpkg(&self, path: &str) -> Option<(String, String)> {
-        // On merged-usr systems (Ubuntu 22.04+), /lib is a symlink to usr/lib.
-        // The dynamic linker reads paths from ld.so.cache which uses /lib/…,
-        // but dpkg's database records files under /usr/lib/….  So
-        // `dpkg -S /lib/x86_64-linux-gnu/libfoo.so.1` fails even though
-        // `dpkg -S /usr/lib/x86_64-linux-gnu/libfoo.so.1` succeeds.
-        //
-        // Strategy: try the path as-is first; if dpkg doesn't recognise it,
-        // resolve symlinks with canonicalize() and retry once.
+        if let Some(index) = &self.dpkg_index {
+            return self.query_dpkg_indexed(path, index);
+        }
+        // Fallback: subprocess (dpkg index not loaded).
+        self.query_dpkg_subprocess(path)
+    }
+
+    /// O(1) lookup in the in-memory dpkg index.
+    ///
+    /// On merged-usr systems `/lib` is a symlink to `usr/lib`, so the dynamic
+    /// linker may open e.g. `/lib/x86_64-linux-gnu/libc.so.6` while dpkg
+    /// records the file as `/usr/lib/x86_64-linux-gnu/libc.so.6`.  When the
+    /// direct lookup fails we resolve symlinks once and retry.
+    fn query_dpkg_indexed(&self, path: &str, index: &DpkgIndex) -> Option<(String, String)> {
+        if let Some(result) = index.lookup(path) {
+            return Some(result);
+        }
+        // Symlink resolution retry (merged-usr /lib → /usr/lib).
+        let canonical = fs::canonicalize(path).ok()?;
+        let canonical_str = canonical.to_str()?;
+        if canonical_str == path {
+            return None;
+        }
+        index.lookup(canonical_str)
+    }
+
+    /// Subprocess fallback used when the dpkg index is unavailable.
+    fn query_dpkg_subprocess(&self, path: &str) -> Option<(String, String)> {
         self.query_dpkg_single(path).or_else(|| {
-            let canonical = std::fs::canonicalize(path).ok()?;
+            let canonical = fs::canonicalize(path).ok()?;
             let canonical_str = canonical.to_str()?;
             if canonical_str == path {
-                return None; // Same path, no point retrying.
+                return None;
             }
             self.query_dpkg_single(canonical_str)
         })
@@ -167,43 +324,27 @@ impl IdentityEngine {
 
     fn query_dpkg_single(&self, path: &str) -> Option<(String, String)> {
         // dpkg -S <path>  →  "libssl3:amd64: /usr/lib/…/libssl.so.3"
-        let out = Command::new("dpkg")
-            .args(["-S", path])
-            .output()
-            .ok()?;
-
+        let out = Command::new("dpkg").args(["-S", path]).output().ok()?;
         if !out.status.success() {
             return None;
         }
 
         let stdout = String::from_utf8_lossy(&out.stdout);
-        // dpkg -S output may contain "diversion" header lines before the
-        // actual ownership line, e.g.:
-        //   diversion by libc6 from: /lib64/ld-linux-x86-64.so.2
-        //   diversion by libc6 to: /lib64/ld-linux-x86-64.so.2.orig
-        //   libc6:amd64: /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
-        // Skip all "diversion" lines; use the first real ownership line.
+        // Skip "diversion" lines that dpkg may emit before the ownership line.
         let ownership_line = stdout
             .lines()
             .find(|l| !l.trim_start().starts_with("diversion"))?;
-        // ownership_line looks like: "libgmp10:i386: /usr/lib/i386-linux-gnu/libgmp.so.10"
-        // Split on ": " to isolate the "name:arch" qualifier from the file path.
+
         let pkg_with_arch = ownership_line.splitn(2, ": ").next()?.trim().to_string();
-        // pkg_with_arch = "libgmp10:i386"; strip arch for the display name.
         let pkg_name = pkg_with_arch.split(':').next().unwrap_or(&pkg_with_arch).to_string();
 
-        // Use the arch-qualified name so dpkg-query returns exactly one version.
-        // Without :arch, dpkg-query concatenates versions for all installed archs
-        // (e.g. amd64 + i386) with no separator, corrupting the version string.
         let ver_out = Command::new("dpkg-query")
             .args(["-W", "-f=${Version}", &pkg_with_arch])
             .output()
             .ok()?;
-
         if !ver_out.status.success() {
             return Some((pkg_name, "unknown".to_string()));
         }
-
         let version = String::from_utf8_lossy(&ver_out.stdout).trim().to_string();
         Some((pkg_name, version))
     }
@@ -212,17 +353,11 @@ impl IdentityEngine {
 
     fn query_pacman(&self, path: &str) -> Option<(String, String)> {
         // pacman -Qo <path>  →  "/usr/lib/… is owned by openssl 3.1.2-1"
-        let out = Command::new("pacman")
-            .args(["-Qo", path])
-            .output()
-            .ok()?;
-
+        let out = Command::new("pacman").args(["-Qo", path]).output().ok()?;
         if !out.status.success() {
             return None;
         }
-
         let stdout = String::from_utf8_lossy(&out.stdout);
-        // "… is owned by <name> <version>"
         let parts: Vec<&str> = stdout.split_whitespace().collect();
         let owned_idx = parts.iter().position(|&w| w == "owned")?;
         let name = parts.get(owned_idx + 2)?.to_string();
@@ -233,21 +368,13 @@ impl IdentityEngine {
     // ---- rpm ----------------------------------------------------------------
 
     fn query_rpm(&self, path: &str) -> Option<(String, String)> {
-        // rpm -qf <path> --queryformat '%{NAME} %{VERSION}-%{RELEASE}\n'
         let out = Command::new("rpm")
-            .args([
-                "-qf",
-                path,
-                "--queryformat",
-                "%{NAME} %{VERSION}-%{RELEASE}",
-            ])
+            .args(["-qf", path, "--queryformat", "%{NAME} %{VERSION}-%{RELEASE}"])
             .output()
             .ok()?;
-
         if !out.status.success() {
             return None;
         }
-
         let stdout = String::from_utf8_lossy(&out.stdout);
         let mut parts = stdout.trim().splitn(2, ' ');
         let name = parts.next()?.to_string();
