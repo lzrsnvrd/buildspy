@@ -1,0 +1,15 @@
+[package]
+name    = "ebpf-component-tracer-common"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# Enables Pod impl and std-based helpers (for user-space)
+user    = ["dep:aya"]
+
+[dependencies]
+aya = { version = "0.13", optional = true }
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,8 @@
+# Always compile BPF programs for the BPF little-endian target.
+[build]
+target = "bpfel-unknown-none"
+
+# Build the `core` crate from source because bpfel-unknown-none has no
+# pre-built sysroot.
+[unstable]
+build-std = ["core"]

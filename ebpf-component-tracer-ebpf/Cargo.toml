@@ -1,0 +1,26 @@
+[package]
+name    = "ebpf-component-tracer-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+# This crate is compiled as a standalone BPF binary (no_std).
+# It is NOT part of the parent workspace to avoid target confusion.
+
+[[bin]]
+# NOTE: Binary name must differ from the package name to avoid a conflict in
+# aya-build 0.1.x, which uses the package name as the cargo --target-dir and
+# the binary name as the destination file name inside OUT_DIR.
+name = "ebpf-tracer-bpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf     = { version = "0.1" }
+aya-log-ebpf = { version = "0.1" }
+ebpf-component-tracer-common = { path = "../ebpf-component-tracer-common" }
+
+[profile.release]
+opt-level     = 3
+lto           = true
+panic         = "abort"
+strip         = true
+codegen-units = 1

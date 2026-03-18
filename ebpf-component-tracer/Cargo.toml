@@ -1,0 +1,41 @@
+[package]
+name    = "ebpf-component-tracer"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ebpf-tracer"
+path = "src/main.rs"
+
+[dependencies]
+# Aya user-space runtime (async tokio backend).
+aya     = { version = "0.13", features = ["async_tokio"] }
+aya-log = { version = "0.2" }
+
+# Shared event types.
+ebpf-component-tracer-common = { path = "../ebpf-component-tracer-common", features = ["user"] }
+
+# Async runtime.
+tokio = { version = "1", features = ["full"] }
+
+# Serialization.
+serde      = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+
+# Hashing for local files.
+sha2 = { version = "0.10" }
+hex  = { version = "0.4" }
+
+# Timestamps.
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling / CLI.
+anyhow    = { version = "1" }
+clap      = { version = "4", features = ["derive"] }
+log       = { version = "0.4" }
+env_logger = { version = "0.11" }
+
+[build-dependencies]
+# aya-build compiles the eBPF crate with the correct nightly toolchain,
+# passes -Clink-arg=--btf for BTF emission, and strips conflicting env vars.
+aya-build = "0.1"

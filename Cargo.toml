@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "ebpf-component-tracer",
+    "ebpf-component-tracer-common",
+    # The eBPF crate must be a workspace member so aya-build can find it via
+    # `cargo build --package`.  It is excluded from the default build so that
+    # plain `cargo build` at the workspace root does NOT try to compile it for
+    # the host target (it targets bpfel-unknown-none and is compiled by
+    # ebpf-component-tracer's build.rs instead).
+    "ebpf-component-tracer-ebpf",
+]
+default-members = [
+    "ebpf-component-tracer",
+    "ebpf-component-tracer-common",
+]
+resolver = "2"
+
+[workspace.package]
+version    = "0.1.0"
+edition    = "2021"
+license    = "MIT"
+authors    = ["ebpf-component-tracer"]
+repository = "https://github.com/example/ebpf-component-tracer"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level        = 3
+lto              = true
+strip            = true
+codegen-units    = 1
+panic            = "abort"
