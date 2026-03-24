@@ -7,6 +7,7 @@
 //!   sudo ebpf-tracer -- cmake --build ./build
 //!   sudo ebpf-tracer --output deps.json -- meson compile -C build
 
+mod cyclonedx;
 mod identity;
 mod resolver;
 
@@ -87,6 +88,10 @@ struct Component {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    src_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hash: Option<String>,
     path: String,
@@ -445,6 +450,38 @@ async fn main() -> Result<()> {
         cli.output.display(),
         report.components.len()
     );
+
+    // ------------------------------------------------------------------
+    // Build CycloneDX BOM and optionally enrich with OSV vulnerabilities.
+    // ------------------------------------------------------------------
+    let distro = cyclonedx::detect_distro();
+    let cdx_components: Vec<cyclonedx::InternalComponent> = report
+        .components
+        .iter()
+        .map(|c| cyclonedx::InternalComponent {
+            name: c.name.clone(),
+            version: c.version.clone(),
+            arch: c.arch.clone(),
+            src_name: c.src_name.clone(),
+            hash: c.hash.clone(),
+            path: c.path.clone(),
+            component_type: c.component_type.clone(),
+        })
+        .collect();
+    let report_ref = cyclonedx::ReportRef {
+        timestamp: &report.timestamp,
+        project_dir: &report.project_dir,
+        components: &cdx_components,
+    };
+    let bom = cyclonedx::build_bom(&report_ref, &distro);
+
+    let cdx_path = cyclonedx::cdx_output_path(&cli.output);
+    let cdx_json =
+        serde_json::to_string_pretty(&bom).context("failed to serialise CycloneDX BOM")?;
+    std::fs::write(&cdx_path, &cdx_json)
+        .with_context(|| format!("failed to write {}", cdx_path.display()))?;
+    log::info!("CycloneDX BOM written to {}.", cdx_path.display());
+
     println!("{}", json);
 
     Ok(())
@@ -662,9 +699,11 @@ fn resolve_component(
     _project_dir: &Path,
 ) -> Component {
     match engine.identify(path) {
-        ComponentIdentity::SystemPackage { name, version } => Component {
+        ComponentIdentity::SystemPackage { name, version, arch, src_name } => Component {
             name,
             version: Some(version),
+            arch,
+            src_name,
             hash: None,
             path: path_str.to_string(),
             component_type: "system_package".to_string(),
@@ -682,6 +721,8 @@ fn resolve_component(
             Component {
                 name,
                 version: None,
+                arch: None,
+                src_name: None,
                 hash: Some(hash),
                 path: path_str.to_string(),
                 component_type: "local_file".to_string(),
@@ -696,6 +737,8 @@ fn resolve_component(
             Component {
                 name,
                 version: None,
+                arch: None,
+                src_name: None,
                 hash: None,
                 path: path_str.to_string(),
                 component_type: "system_unknown".to_string(),
