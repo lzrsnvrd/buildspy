@@ -3,3 +3,4 @@ ebpf-component-tracer-ebpf/target/
 report.json
 *.swp
 .env
+.claude

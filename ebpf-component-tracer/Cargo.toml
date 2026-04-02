@@ -32,6 +32,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # UUID v4 for CycloneDX serialNumber.
 uuid = { version = "1", features = ["v4"] }
 
+# TOML parsing (Cargo.lock, poetry.lock).
+toml = { version = "0.8" }
+
 # Error handling / CLI.
 anyhow    = { version = "1" }
 clap      = { version = "4", features = ["derive"] }

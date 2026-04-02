@@ -7,6 +7,8 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
+
+use crate::report::Component;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -166,24 +168,10 @@ pub struct Occurrence {
     pub location: String,
 }
 
-// ---------------------------------------------------------------------------
-// Internal component type (bridges main.rs → cyclonedx.rs)
-// ---------------------------------------------------------------------------
-
-pub struct InternalComponent {
-    pub name: String,
-    pub version: Option<String>,
-    pub arch: Option<String>,
-    pub src_name: Option<String>,
-    pub hash: Option<String>,
-    pub path: String,
-    pub component_type: String,
-}
-
 pub struct ReportRef<'a> {
     pub timestamp: &'a str,
     pub project_dir: &'a str,
-    pub components: &'a [InternalComponent],
+    pub components: &'a [Component],
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +230,7 @@ pub fn build_bom(report: &ReportRef<'_>, distro: &str) -> Bom {
     }
 }
 
-fn to_cdx_component(c: &InternalComponent, distro: &str) -> Option<CdxComponent> {
+fn to_cdx_component(c: &Component, distro: &str) -> Option<CdxComponent> {
     match c.component_type.as_str() {
         "system_package" => {
             let version = c.version.as_deref().unwrap_or("unknown");
@@ -300,6 +288,19 @@ fn to_cdx_component(c: &InternalComponent, distro: &str) -> Option<CdxComponent>
                 occurrences: vec![Occurrence { location: c.path.clone() }],
             }),
         }),
+        "ecosystem_package" => {
+            // Pre-computed PURL from the lock-file parser.
+            let purl = c.purl.clone();
+            Some(CdxComponent {
+                bom_ref: purl.clone(),
+                component_type: "library".to_string(),
+                name: c.name.clone(),
+                version: c.version.clone(),
+                purl,
+                hashes: vec![],
+                evidence: None, // no on-disk file path to report
+            })
+        }
         _ => None,
     }
 }
