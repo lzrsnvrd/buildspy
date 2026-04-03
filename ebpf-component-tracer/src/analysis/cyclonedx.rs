@@ -7,9 +7,9 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
-
-use crate::report::Component;
 use uuid::Uuid;
+
+use super::report::Component;
 
 // ---------------------------------------------------------------------------
 // OS / distro detection
@@ -76,15 +76,11 @@ pub fn system_purl(
     let namespace = distro.split('-').next().unwrap_or(distro);
     let ver = purl_encode(version);
 
-    // Build qualifiers in alphabetical order (PURL spec recommendation).
     let mut qualifiers = Vec::new();
     if let Some(a) = arch {
         qualifiers.push(format!("arch={a}"));
     }
     qualifiers.push(format!("distro={distro}"));
-    // `upstream` qualifier: the source package name when it differs from the
-    // binary package name.  Helps CVE databases link binary packages to the
-    // upstream project where the vulnerability was filed.
     if let Some(src) = src_name {
         qualifiers.push(format!("upstream={src}"));
     }
@@ -116,7 +112,6 @@ pub struct Bom {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Metadata {
     pub timestamp: String,
-    /// CycloneDX 1.6: `tools` is `{"components": [...]}`, not a bare array.
     pub tools: ToolsWrapper,
     pub component: CdxComponent,
 }
@@ -186,8 +181,6 @@ pub fn build_bom(report: &ReportRef<'_>, distro: &str) -> Bom {
 
     let (os_name, os_version) = distro.split_once('-').unwrap_or((distro, ""));
 
-    // Standard CycloneDX operating-system component — identifies the host OS
-    // so scanners can resolve the correct vulnerability database.
     let os_component = CdxComponent {
         bom_ref: Some("os-component".to_string()),
         component_type: "operating-system".to_string(),
@@ -289,7 +282,6 @@ fn to_cdx_component(c: &Component, distro: &str) -> Option<CdxComponent> {
             }),
         }),
         "ecosystem_package" => {
-            // Pre-computed PURL from the lock-file parser.
             let purl = c.purl.clone();
             Some(CdxComponent {
                 bom_ref: purl.clone(),
@@ -298,7 +290,7 @@ fn to_cdx_component(c: &Component, distro: &str) -> Option<CdxComponent> {
                 version: c.version.clone(),
                 purl,
                 hashes: vec![],
-                evidence: None, // no on-disk file path to report
+                evidence: None,
             })
         }
         _ => None,

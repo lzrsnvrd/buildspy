@@ -3,40 +3,27 @@
 //! Usage:
 //!   sudo ebpf-tracer [OPTIONS] -- <build command>
 //!
-//! Example:
+//! Examples:
 //!   sudo ebpf-tracer -- cmake --build ./build
+//!   sudo ebpf-tracer --backend ptrace -- make -j$(nproc)
 //!   sudo ebpf-tracer --output deps.json -- meson compile -C build
 
-mod cyclonedx;
-mod ebpf;
+mod analysis;
+mod backends;
 mod ecosystem;
-mod identity;
-mod proc_watcher;
-mod report;
-mod resolver;
 
-use std::{
-    collections::HashMap,
-    env,
-    path::PathBuf,
-    time::Duration,
-};
+use std::{collections::HashMap, env, path::PathBuf};
 
-use anyhow::{anyhow, Context, Result};
-use aya::Ebpf;
-use aya_log::EbpfLogger;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
-use identity::IdentityEngine;
-use report::{Component, Report};
 
-// ---------------------------------------------------------------------------
-// Embedded eBPF bytecode (compiled by build.rs via aya-build).
-// `include_bytes_aligned!` aligns the data to 32 bytes as required by Aya's
-// ELF parser.  aya-build places the binary at OUT_DIR/<binary-name>.
-// ---------------------------------------------------------------------------
-static EBPF_BYTECODE: &[u8] =
-    aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/ebpf-tracer-bpf"));
+use analysis::{
+    cyclonedx,
+    identity::IdentityEngine,
+    report::{Component, Report},
+};
+use backends::{Backend, TracingSession};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -46,7 +33,7 @@ static EBPF_BYTECODE: &[u8] =
 #[command(
     author,
     version,
-    about = "eBPF-powered SCA tracer – records every library/header opened during a build"
+    about = "SCA tracer – records every library/header opened during a build"
 )]
 struct Cli {
     /// Path for the JSON report (default: report.json).
@@ -58,13 +45,20 @@ struct Cli {
     #[arg(short, long)]
     project_dir: Option<PathBuf>,
 
-    /// Enable verbose eBPF log output (requires `RUST_LOG=debug`).
+    /// Enable verbose log output.
     #[arg(short, long)]
     verbose: bool,
 
     /// Include dev/test dependencies from lock files (default: prod-only).
     #[arg(long)]
     ecosystem_dev: bool,
+
+    /// Tracing backend to use.
+    /// "ebpf"  – eBPF ring-buffer (requires Linux ≥ 4.4 + CAP_BPF).
+    /// "ptrace" – ptrace syscall interception (any kernel, CAP_SYS_PTRACE).
+    /// "auto"  – try eBPF first, fall back to ptrace (default).
+    #[arg(long, default_value = "auto")]
+    backend: String,
 
     /// The build command and its arguments (everything after `--`).
     #[arg(last = true, required = true)]
@@ -93,67 +87,62 @@ async fn main() -> Result<()> {
     log::info!("Output        : {}", cli.output.display());
 
     // ------------------------------------------------------------------
-    // Load eBPF and start event collection.
+    // Start the tracing session.
     // ------------------------------------------------------------------
-    let mut bpf = load_ebpf(cli.verbose)?;
-    let ring_buf = ebpf::take_ring_buf(&mut bpf)?;
-
-    let (path_tx, mut path_rx) = tokio::sync::mpsc::unbounded_channel::<(String, u32)>();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let event_task = ebpf::spawn_event_task(ring_buf, path_tx, stop_rx);
+    let backend = Backend::from_str(&cli.backend);
+    let mut session: TracingSession =
+        backends::start_session(backend, &cli.build_command, &project_dir, cli.verbose)?;
 
     // ------------------------------------------------------------------
-    // Spawn build command with race-free PID tracking.
-    // See inline comments in `spawn_build` for the three-step strategy.
+    // Run the build: collect PID metadata and wait for completion.
     // ------------------------------------------------------------------
-    let (mut child, child_pid) = spawn_build(&mut bpf, &cli, &project_dir)?;
-
-    // ------------------------------------------------------------------
-    // Run the build: watch for new child PIDs and wait for completion.
-    // ------------------------------------------------------------------
-    let (new_pid_tx, mut new_pid_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let mut pid_to_comm: HashMap<u32, String> = HashMap::new();
     let mut pid_to_cwd: HashMap<u32, PathBuf> = HashMap::new();
 
-    tokio::spawn(proc_watcher::watch_children(child_pid, new_pid_tx));
-
-    let exit_status = loop {
+    let exit_code = loop {
         tokio::select! {
-            Some(pid) = new_pid_rx.recv() => {
-                if let Err(e) = ebpf::pid_filter_insert(&mut bpf, pid) {
-                    log::warn!("failed to track PID {pid}: {e}");
-                }
+            Some(pid) = session.new_pid_rx.recv() => {
                 let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
                     .unwrap_or_default();
                 let comm = comm.trim().to_string();
-                log::debug!("proc-watcher: tracking PID {} ({})", pid, comm);
+                log::debug!("Tracking PID {} ({})", pid, comm);
                 pid_to_comm.insert(pid, comm);
                 if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
                     pid_to_cwd.insert(pid, cwd);
                 }
             }
-            result = child.wait() => {
-                break result.context("failed to wait for child")?;
+            result = &mut session.exit_rx => {
+                // exit_rx resolves only after the backend has flushed all events.
+                let code = result.ok().flatten();
+                log::info!(
+                    "Build finished (exit code: {}).",
+                    code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+                );
+                break code;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                log::warn!("Interrupted – shutting down build and generating partial report.");
+                if let Some(shutdown_fn) = session.shutdown.take() {
+                    shutdown_fn();
+                }
+                // Wait for the ptrace thread to finish draining and send exit_rx.
+                let code = (&mut session.exit_rx).await.ok().flatten();
+                break code;
             }
         }
     };
-
-    log::info!(
-        "Build finished (exit code: {}).",
-        exit_status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
-    );
-
-    // Give the ring buffer a moment to flush, then shut down the event task.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let _ = stop_tx.send(());
-    let _ = event_task.await;
 
     // ------------------------------------------------------------------
     // Post-build analysis: resolve paths → components + ecosystem scan.
     // ------------------------------------------------------------------
     let engine = IdentityEngine::new();
-    let mut components =
-        report::collect_components(&mut path_rx, &pid_to_comm, &pid_to_cwd, &project_dir, &engine);
+    let mut components = analysis::report::collect_components(
+        &mut session.path_rx,
+        &pid_to_comm,
+        &pid_to_cwd,
+        &project_dir,
+        &engine,
+    );
 
     let eco_components = ecosystem::detect(&project_dir, &pid_to_comm, cli.ecosystem_dev);
     log::info!("Ecosystem components: {}.", eco_components.len());
@@ -183,14 +172,18 @@ async fn main() -> Result<()> {
         timestamp: Utc::now().to_rfc3339(),
         build_command: build_command_str,
         project_dir: project_dir.to_string_lossy().to_string(),
-        exit_code: exit_status.code(),
+        exit_code,
         components: component_list,
     };
 
     let json = serde_json::to_string_pretty(&report).context("failed to serialise report")?;
     std::fs::write(&cli.output, &json)
         .with_context(|| format!("failed to write {}", cli.output.display()))?;
-    log::info!("Report written to {} ({} components).", cli.output.display(), report.components.len());
+    log::info!(
+        "Report written to {} ({} components).",
+        cli.output.display(),
+        report.components.len()
+    );
 
     let distro = cyclonedx::detect_distro();
     let bom = cyclonedx::build_bom(
@@ -202,70 +195,12 @@ async fn main() -> Result<()> {
         &distro,
     );
     let cdx_path = cyclonedx::cdx_output_path(&cli.output);
-    let cdx_json = serde_json::to_string_pretty(&bom).context("failed to serialise CycloneDX BOM")?;
+    let cdx_json =
+        serde_json::to_string_pretty(&bom).context("failed to serialise CycloneDX BOM")?;
     std::fs::write(&cdx_path, &cdx_json)
         .with_context(|| format!("failed to write {}", cdx_path.display()))?;
     log::info!("CycloneDX BOM written to {}.", cdx_path.display());
 
     println!("{}", json);
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Load the eBPF object, optionally enable the kernel-side logger, and attach
-/// the three required tracepoints.
-fn load_ebpf(verbose: bool) -> Result<Ebpf> {
-    let mut bpf = Ebpf::load(EBPF_BYTECODE)
-        .context("failed to load eBPF bytecode – are you running as root?")?;
-
-    if verbose {
-        if let Err(e) = EbpfLogger::init(&mut bpf) {
-            log::warn!("eBPF logger unavailable: {e}");
-        }
-    }
-
-    ebpf::attach_tracepoint(&mut bpf, "sched_process_fork", "sched", "sched_process_fork")?;
-    ebpf::attach_tracepoint(&mut bpf, "sched_process_exit", "sched", "sched_process_exit")?;
-    ebpf::attach_tracepoint(&mut bpf, "sys_enter_openat", "syscalls", "sys_enter_openat")?;
-    log::info!("eBPF tracepoints attached.");
-
-    Ok(bpf)
-}
-
-/// Spawn the build command with race-free PID filter setup.
-///
-/// Strategy:
-///   1. Insert OUR OWN TGID into the filter BEFORE the fork so that
-///      `sched_process_fork` fires correctly even when tokio uses a worker
-///      thread to do the fork.
-///   2. After spawn, also insert `child_pid` explicitly as a safety net for
-///      the tiny window before `sched_process_fork` fires.
-///   3. Remove our own TGID so we don't track our own file opens.
-fn spawn_build(
-    bpf: &mut Ebpf,
-    cli: &Cli,
-    project_dir: &std::path::Path,
-) -> Result<(tokio::process::Child, u32)> {
-    let our_tgid = std::process::id();
-    ebpf::pid_filter_insert(bpf, our_tgid)?;
-
-    let child = tokio::process::Command::new(&cli.build_command[0])
-        .args(&cli.build_command[1..])
-        .current_dir(project_dir)
-        .spawn()
-        .with_context(|| format!("failed to spawn '{}'", cli.build_command[0]))?;
-
-    let child_pid = child
-        .id()
-        .ok_or_else(|| anyhow!("could not retrieve child PID"))?;
-    log::info!("Build started (PID {}).", child_pid);
-
-    // Inserting child_pid is idempotent; covers the rare race before the fork tracepoint fires.
-    ebpf::pid_filter_insert(bpf, child_pid)?;
-    ebpf::pid_filter_remove(bpf, our_tgid);
-
-    Ok((child, child_pid))
 }

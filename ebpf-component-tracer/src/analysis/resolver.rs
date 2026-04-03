@@ -1,6 +1,6 @@
 //! Path normalization and noise filtering.
 //!
-//! The eBPF layer captures *every* `openat` call made by tracked processes,
+//! The tracing layer captures *every* `openat` call made by tracked processes,
 //! including temporary files, proc entries, and pipes.  This module keeps
 //! only the paths that are relevant for SCA.
 

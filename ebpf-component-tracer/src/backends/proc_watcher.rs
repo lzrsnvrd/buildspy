@@ -106,7 +106,6 @@ fn discover_via_children_file(known: &HashSet<u32>) -> Option<Vec<u32>> {
     if any_file_found {
         Some(new_pids)
     } else {
-        // No children files found – this kernel may not have CONFIG_PROC_CHILDREN.
         None
     }
 }
