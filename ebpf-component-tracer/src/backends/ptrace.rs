@@ -137,6 +137,29 @@ pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession
         .context("failed to spawn ptrace thread")?;
 
     let our_pid = std::process::id() as i32;
+
+    // Watchdog: every 10 s of silence, poke the ptrace thread via SIGUSR1 so
+    // it logs which processes are still alive and what they're blocked on.
+    // Uses the same SIGUSR1 / EINTR path as the shutdown mechanism, but without
+    // setting the shutdown flag, so the loop just logs and continues.
+    {
+        let tid_watch = Arc::clone(&ptrace_tid);
+        let shutdown_watch = Arc::clone(&shutdown);
+        std::thread::Builder::new()
+            .name("ptrace-watchdog".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                if shutdown_watch.load(Ordering::Acquire) {
+                    break;
+                }
+                let tid = tid_watch.load(Ordering::Acquire);
+                if tid != 0 {
+                    unsafe { libc::tgkill(our_pid, tid, libc::SIGUSR1) };
+                }
+            })
+            .ok();
+    }
+
     let shutdown_fn: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
         shutdown.store(true, Ordering::Release);
         // Wake the ptrace thread from its blocking waitpid() via tgkill(SIGUSR1).
@@ -261,24 +284,29 @@ fn ptrace_loop(
                     }
                     break;
                 }
-                // Spurious EINTR – re-log stall info and keep going.
+                // Watchdog SIGUSR1 – log which processes are still alive.
                 still_alive_count += 1;
-                if still_alive_count % 5 == 0 {
-                    let mut alive: Vec<u32> = alive_pids.iter().copied().collect();
-                    alive.sort_unstable();
-                    log::warn!(
-                        "ptrace: waitpid interrupted ({} times) – {} process(es) still alive: {:?}",
-                        still_alive_count,
-                        alive.len(),
-                        alive,
-                    );
-                    for pid in &alive {
-                        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-                            .unwrap_or_else(|_| "<exited>".into());
-                        let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan"))
-                            .unwrap_or_default();
-                        log::warn!("  PID {pid}: comm={}, wchan={}", comm.trim(), wchan.trim());
-                    }
+                let mut alive: Vec<u32> = alive_pids.iter().copied().collect();
+                alive.sort_unstable();
+                log::warn!(
+                    "ptrace: stall #{} – {} process(es) still alive:",
+                    still_alive_count,
+                    alive.len(),
+                );
+                for pid in &alive {
+                    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                        .unwrap_or_else(|_| "<exited>".into());
+                    let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan"))
+                        .unwrap_or_default();
+                    // Also read /proc/{pid}/status for Parent PID (PPid).
+                    let ppid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                        .unwrap_or_default()
+                        .lines()
+                        .find(|l| l.starts_with("PPid:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("?")
+                        .to_string();
+                    log::warn!("  PID {pid} (ppid={ppid}): comm={}, wchan={}", comm.trim(), wchan.trim());
                 }
                 continue;
             }
