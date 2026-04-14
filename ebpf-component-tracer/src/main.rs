@@ -132,6 +132,15 @@ async fn main() -> Result<()> {
         }
     };
 
+    while let Ok(pid) = session.new_pid_rx.try_recv() {                                                                                                                                                                                                   
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))                                                                                                                                                                                   
+            .unwrap_or_default().trim().to_string();                   
+        pid_to_comm.insert(pid, comm);                                                                                                                                                                                                                    
+        if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+            pid_to_cwd.insert(pid, cwd);                                                                                                                                                                                                                  
+        }                               
+    } 
+
     // ------------------------------------------------------------------
     // Post-build analysis: resolve paths → components + ecosystem scan.
     // ------------------------------------------------------------------

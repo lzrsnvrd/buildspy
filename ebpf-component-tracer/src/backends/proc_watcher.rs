@@ -50,7 +50,7 @@ pub async fn watch_children(root_pid: u32, tx: tokio::sync::mpsc::UnboundedSende
         if !Path::new(&format!("/proc/{root_pid}")).exists() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 

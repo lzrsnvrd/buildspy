@@ -6,22 +6,23 @@
 //! Public surface: `start()` which returns a `TracingSession`.
 
 use std::{
+    os::unix::io::AsRawFd,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
-    maps::{HashMap as AyaHashMap, MapData, RingBuf},
+    maps::{HashMap as AyaHashMap, MapData, PerCpuArray, RingBuf},
     programs::TracePoint,
     Ebpf,
 };
 use ebpf_component_tracer_common::FileEvent;
-use tokio::{
-    io::unix::AsyncFd,
-    sync::mpsc::{unbounded_channel, UnboundedSender},
-};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use super::TracingSession;
 
@@ -69,8 +70,8 @@ pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession
 
     // Ring-buffer event task.
     let (path_tx, path_rx) = unbounded_channel::<(String, u32)>();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    spawn_event_task(ring_buf, path_tx, stop_rx);
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let drain_done_rx = spawn_event_task(ring_buf, path_tx, Arc::clone(&stop_flag));
 
     // PID tracking: proc_watcher discovers new children; a fan-out task inserts
     // them into the eBPF PID filter AND forwards them to the external channel.
@@ -103,7 +104,38 @@ pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession
         };
         // Allow the ring buffer 300 ms to flush any remaining events.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = stop_tx.send(());
+
+        // Signal the drain thread to perform its final drain and exit.
+        stop_flag.store(true, Ordering::Release);
+
+        // Wait for the drain thread to fully finish — this guarantees that every
+        // event has been sent to path_tx before we signal main to read path_rx.
+        // Without this wait, collect_components (which uses try_recv) could run
+        // before the drain thread's final drain, losing events.
+        let _ = drain_done_rx.await;
+
+        // Read and log diagnostic counters before detaching tracepoints.
+        if let Ok(b) = bpf.lock() {
+            let dropped = read_dropped_count(&b);
+            if dropped > 0 {
+                log::warn!(
+                    "eBPF ring buffer dropped {dropped} event(s) — some paths may be missing. \
+                     Consider increasing the ring buffer size further."
+                );
+            } else {
+                log::debug!("eBPF ring buffer: no events dropped.");
+            }
+
+            let failed = read_failed_pid_inserts(&b);
+            if failed > 0 {
+                log::warn!(
+                    "eBPF PID_FILTER: failed to insert {failed} PID(s) during fork — \
+                     those processes were not tracked immediately. proc_watcher provided \
+                     ~5 ms delayed fallback, but early openat calls may have been missed."
+                );
+            }
+        }
+
         let _ = exit_tx.send(code);
         // Dropping bpf here detaches all tracepoints.
         drop(bpf);
@@ -129,6 +161,18 @@ fn load(verbose: bool) -> Result<Ebpf> {
     attach_tracepoint(&mut bpf, "sched_process_fork", "sched", "sched_process_fork")?;
     attach_tracepoint(&mut bpf, "sched_process_exit", "sched", "sched_process_exit")?;
     attach_tracepoint(&mut bpf, "sys_enter_openat", "syscalls", "sys_enter_openat")?;
+
+    // sys_enter_open: legacy open() syscall, x86-64 only (SYS_open = 2).
+    // Absent on arm64/riscv64 which have only openat — skip gracefully.
+    if let Err(e) = attach_tracepoint(&mut bpf, "sys_enter_open", "syscalls", "sys_enter_open") {
+        log::debug!("sys_enter_open tracepoint unavailable (non-x86 or kernel config): {e}");
+    }
+
+    // sys_enter_openat2: requires Linux >= 5.6 (SYS_openat2 = 437).
+    if let Err(e) = attach_tracepoint(&mut bpf, "sys_enter_openat2", "syscalls", "sys_enter_openat2") {
+        log::debug!("sys_enter_openat2 tracepoint unavailable (kernel < 5.6?): {e}");
+    }
+
     log::info!("eBPF tracepoints attached.");
 
     Ok(bpf)
@@ -181,38 +225,59 @@ pub fn pid_filter_remove(bpf: &mut Ebpf, pid: u32) {
 // Ring-buffer event task
 // ---------------------------------------------------------------------------
 
+/// Drains the ring buffer on a dedicated OS thread using `libc::poll`.
+///
+/// Returns a oneshot `Receiver` that resolves when the thread has fully
+/// finished its final drain and dropped `path_tx`.  The exit task must
+/// `.await` this before sending `exit_tx` so that `collect_components`
+/// (which uses `try_recv`) sees every event already in the channel.
 fn spawn_event_task(
     ring_buf: RingBuf<MapData>,
     path_tx: UnboundedSender<(String, u32)>,
-    stop_rx: tokio::sync::oneshot::Receiver<()>,
-) {
-    tokio::spawn(async move {
-        let mut async_fd = match AsyncFd::new(ring_buf) {
-            Ok(fd) => fd,
-            Err(e) => {
-                log::error!("AsyncFd::new failed: {e}");
-                return;
-            }
-        };
-        let mut stop_rx = stop_rx;
+    stop: Arc<AtomicBool>,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    std::thread::spawn(move || {
+        let mut ring_buf = ring_buf;
+        let fd = ring_buf.as_raw_fd();
+
         loop {
-            tokio::select! {
-                _ = &mut stop_rx => {
-                    // Non-blocking final drain before shutdown.
-                    drain_ring_buf(async_fd.get_mut(), &path_tx);
-                    break;
-                }
-                result = async_fd.readable_mut() => {
-                    let mut guard = match result {
-                        Ok(g) => g,
-                        Err(e) => { log::error!("poll error: {e}"); break; }
-                    };
-                    drain_ring_buf(guard.get_inner_mut(), &path_tx);
-                    guard.clear_ready();
-                }
+            // Wait up to 10 ms for new data; short timeout lets us check the
+            // stop flag frequently without busy-spinning.
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            unsafe { libc::poll(&mut pfd, 1, 10) };
+
+            drain_ring_buf(&mut ring_buf, &path_tx);
+
+            if stop.load(Ordering::Acquire) {
+                // Final drain after stop signal — catches events that arrived
+                // in the 300 ms window after the build exited.
+                drain_ring_buf(&mut ring_buf, &path_tx);
+                break;
             }
         }
+
+        // path_tx is dropped here, closing the channel.
+        // done_tx signals the exit task that all events have been sent.
+        let _ = done_tx.send(());
     });
+
+    done_rx
+}
+
+fn read_dropped_count(bpf: &Ebpf) -> u64 {
+    let Some(map) = bpf.map("DROPPED_EVENTS") else { return 0 };
+    let Ok(arr) = PerCpuArray::<_, u32>::try_from(map) else { return 0 };
+    let Ok(values) = arr.get(&0, 0) else { return 0 };
+    values.iter().map(|v| *v as u64).sum()
+}
+
+fn read_failed_pid_inserts(bpf: &Ebpf) -> u64 {
+    let Some(map) = bpf.map("FAILED_PID_INSERTS") else { return 0 };
+    let Ok(arr) = PerCpuArray::<_, u32>::try_from(map) else { return 0 };
+    let Ok(values) = arr.get(&0, 0) else { return 0 };
+    values.iter().map(|v| *v as u64).sum()
 }
 
 fn drain_ring_buf(rb: &mut RingBuf<MapData>, tx: &UnboundedSender<(String, u32)>) {
