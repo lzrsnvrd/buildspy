@@ -1,10 +1,10 @@
 [package]
-name    = "ebpf-component-tracer"
+name    = "buildspy"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "ebpf-tracer"
+name = "buildspy"
 path = "src/main.rs"
 
 [dependencies]
@@ -13,7 +13,7 @@ aya     = { version = "0.13", features = ["async_tokio"] }
 aya-log = { version = "0.2" }
 
 # Shared event types.
-ebpf-component-tracer-common = { path = "../ebpf-component-tracer-common", features = ["user"] }
+buildspy-common = { path = "../buildspy-common", features = ["user"] }
 
 # Async runtime.
 tokio = { version = "1", features = ["full"] }

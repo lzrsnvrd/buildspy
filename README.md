@@ -1,4 +1,4 @@
-# build_analyzer
+# buildspy
 
 A Software Composition Analysis (SCA) tool that traces every library, header, and
 source file opened during a build process. Intercepts `openat` syscalls at the kernel
@@ -26,25 +26,25 @@ rustup toolchain install nightly --component rust-src
 cargo install bpf-linker
 
 # Build
-cargo build --release -p ebpf-component-tracer
+cargo build --release -p buildspy
 ```
 
-The binary is at `target/release/ebpf-component-tracer`.
+The binary is at `target/release/buildspy`.
 
 ## Usage
 
 ```bash
 # eBPF backend (default; requires root or CAP_BPF)
-sudo ./ebpf-component-tracer -- cmake --build ./build
+sudo ./buildspy -- cmake --build ./build
 
 # ptrace backend (slower but works without CAP_BPF)
-sudo ./ebpf-component-tracer --backend ptrace -- make -j$(nproc)
+sudo ./buildspy --backend ptrace -- make -j$(nproc)
 
 # Custom output path
-sudo ./ebpf-component-tracer --output deps.json -- ninja -C build
+sudo ./buildspy --output deps.json -- ninja -C build
 
 # Include dev dependencies from lock files
-sudo ./ebpf-component-tracer --ecosystem-dev -- cargo build
+sudo ./buildspy --ecosystem-dev -- cargo build
 ```
 
 ### Options

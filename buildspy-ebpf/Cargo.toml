@@ -1,5 +1,5 @@
 [package]
-name    = "ebpf-component-tracer-ebpf"
+name    = "buildspy-ebpf"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,13 +10,13 @@ edition = "2021"
 # NOTE: Binary name must differ from the package name to avoid a conflict in
 # aya-build 0.1.x, which uses the package name as the cargo --target-dir and
 # the binary name as the destination file name inside OUT_DIR.
-name = "ebpf-tracer-bpf"
+name = "buildspy-bpf"
 path = "src/main.rs"
 
 [dependencies]
 aya-ebpf     = { version = "0.1" }
 aya-log-ebpf = { version = "0.1" }
-ebpf-component-tracer-common = { path = "../ebpf-component-tracer-common" }
+buildspy-common = { path = "../buildspy-common" }
 
 [profile.release]
 opt-level     = 3

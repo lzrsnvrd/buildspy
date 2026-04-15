@@ -1,12 +1,12 @@
-//! ebpf-component-tracer – user-space entry point.
+//! buildspy – user-space entry point.
 //!
 //! Usage:
-//!   sudo ebpf-tracer [OPTIONS] -- <build command>
+//!   sudo buildspy [OPTIONS] -- <build command>
 //!
 //! Examples:
-//!   sudo ebpf-tracer -- cmake --build ./build
-//!   sudo ebpf-tracer --backend ptrace -- make -j$(nproc)
-//!   sudo ebpf-tracer --output deps.json -- meson compile -C build
+//!   sudo buildspy -- cmake --build ./build
+//!   sudo buildspy --backend ptrace -- make -j$(nproc)
+//!   sudo buildspy --output deps.json -- meson compile -C build
 
 mod analysis;
 mod backends;

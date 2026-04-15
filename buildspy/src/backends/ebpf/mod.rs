@@ -22,7 +22,7 @@ use aya::{
     programs::TracePoint,
     Ebpf, EbpfLoader,
 };
-use ebpf_component_tracer_common::{FileEvent, EVENT_KIND_FORK};
+use buildspy_common::{FileEvent, EVENT_KIND_FORK};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use super::TracingSession;
@@ -32,7 +32,7 @@ use super::TracingSession;
 // ---------------------------------------------------------------------------
 
 static EBPF_BYTECODE: &[u8] =
-    aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/ebpf-tracer-bpf"));
+    aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/buildspy-bpf"));
 
 // ---------------------------------------------------------------------------
 // Public entry-point
@@ -408,7 +408,7 @@ fn drain_ring_buf(
         }
 
         let filename_len =
-            (event.filename_len as usize).min(ebpf_component_tracer_common::MAX_FILENAME_LEN);
+            (event.filename_len as usize).min(buildspy_common::MAX_FILENAME_LEN);
         let raw = match std::str::from_utf8(&event.filename[..filename_len]) {
             Ok(s) => s.trim_end_matches('\0').to_string(),
             Err(_) => String::from_utf8_lossy(&event.filename[..filename_len])

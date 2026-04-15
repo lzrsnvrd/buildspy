@@ -1,5 +1,5 @@
 [package]
-name    = "ebpf-component-tracer-common"
+name    = "buildspy-common"
 version.workspace = true
 edition.workspace = true
 

@@ -205,7 +205,7 @@ pub fn build_bom(report: &ReportRef<'_>, distro: &str) -> Bom {
             tools: ToolsWrapper {
                 components: vec![Tool {
                     tool_type: "application".to_string(),
-                    name: "ebpf-component-tracer".to_string(),
+                    name: "buildspy".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                 }],
             },

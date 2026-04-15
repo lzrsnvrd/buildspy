@@ -5,7 +5,7 @@
 ```
 build_analyzer/
 ├── Cargo.toml                        workspace root (default-members excludes ebpf crate)
-├── ebpf-component-tracer/            user-space binary
+├── buildspy/                         user-space binary
 │   ├── build.rs                      compiles the eBPF crate via aya-build
 │   └── src/
 │       ├── main.rs                   CLI, event loop, report assembly
@@ -32,9 +32,9 @@ build_analyzer/
 │           ├── npm.rs                package-lock.json / yarn.lock
 │           ├── python.rs             poetry.lock / requirements.txt
 │           └── golang.rs             go.mod / go.sum
-├── ebpf-component-tracer-common/
+├── buildspy-common/
 │   └── src/lib.rs                    FileEvent struct (no_std + std dual-build)
-└── ebpf-component-tracer-ebpf/
+└── buildspy-ebpf/
     └── src/main.rs                   kernel eBPF program (no_std, bpfel-unknown-none)
 ```
 
@@ -114,7 +114,7 @@ pub struct TracingSession {
 `exit_rx` resolves only **after** the backend has flushed all in-flight events.
 `shutdown` is `Some` only for ptrace; eBPF handles cleanup itself via drop.
 
-### `FileEvent` (`ebpf-component-tracer-common/src/lib.rs`)
+### `FileEvent` (`buildspy-common/src/lib.rs`)
 
 ```rust
 #[repr(C)]
@@ -148,7 +148,7 @@ Variant order defines the sort order in the output report.
 
 ## eBPF kernel program
 
-Five tracepoints in `ebpf-component-tracer-ebpf/src/main.rs`:
+Five tracepoints in `buildspy-ebpf/src/main.rs`:
 
 | Tracepoint | Purpose |
 |---|---|

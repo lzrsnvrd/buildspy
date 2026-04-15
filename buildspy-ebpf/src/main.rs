@@ -1,4 +1,4 @@
-//! eBPF kernel programs for the ebpf-component-tracer.
+//! eBPF kernel programs for buildspy.
 //!
 //! Tracepoints attached:
 //!  * `sched/sched_process_fork`      – propagates tracking to child processes.
@@ -17,7 +17,28 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::debug;
 use aya_log_ebpf::info;
-use ebpf_component_tracer_common::{FileEvent, MAX_FILENAME_LEN, EVENT_KIND_FORK, EVENT_KIND_OPEN};
+use buildspy_common::{FileEvent, MAX_FILENAME_LEN, EVENT_KIND_FORK, EVENT_KIND_OPEN};
+
+// ---------------------------------------------------------------------------
+// Configurable tracepoint field offsets
+//
+// Patched by user-space at load time via `EbpfLoader::set_global()` after
+// reading /sys/kernel/tracing/events/<cat>/<event>/format.  The defaults
+// here match the layout that has been stable since Linux 5.10+ on x86-64;
+// they serve as a safe fallback when tracefs is unavailable.
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+static FORK_CHILD_PID_OFFSET: u32 = 20;
+
+#[no_mangle]
+static OPEN_FILENAME_OFFSET: u32 = 16;
+
+#[no_mangle]
+static OPENAT_FILENAME_OFFSET: u32 = 24;
+
+#[no_mangle]
+static OPENAT2_FILENAME_OFFSET: u32 = 24;
 
 // ---------------------------------------------------------------------------
 // Maps
@@ -45,17 +66,11 @@ static FAILED_PID_INSERTS: PerCpuArray<u32> = PerCpuArray::with_max_entries(1, 0
 // ---------------------------------------------------------------------------
 // sched_process_fork  –  propagate PID tracking to child processes
 //
-// Tracepoint format (from /sys/kernel/tracing/events/sched/sched_process_fork):
-//   offset  0-7:   common header  (u16 type, u8 flags, u8 preempt, i32 pid)
-//   offset  8-11:  parent_comm  __data_loc char[]  (4-byte encoded ref, NOT char[16])
-//   offset 12-15:  parent_pid (pid_t / i32)
-//   offset 16-19:  child_comm   __data_loc char[]  (4-byte encoded ref)
-//   offset 20-23:  child_pid (pid_t / i32)
-//
-// NOTE: On modern kernels comm fields use __data_loc (a 4-byte reference to
-// a dynamic string appended after the fixed fields), not a fixed char[16].
-// This is verified via:
-//   cat /sys/kernel/tracing/events/sched/sched_process_fork/format
+// The child_pid field offset is read at startup from:
+//   /sys/kernel/tracing/events/sched/sched_process_fork/format
+// and injected into FORK_CHILD_PID_OFFSET before the program is loaded.
+// This prevents breakage when the kernel changes the tracepoint layout
+// (e.g. switching comm fields between char[16] and __data_loc).
 // ---------------------------------------------------------------------------
 #[tracepoint]
 pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
@@ -79,9 +94,10 @@ unsafe fn try_fork(ctx: &TracePointContext) -> Result<u32, i64> {
     // so its upper 32 bits give the parent's TGID regardless of which thread
     // initiated the fork.
     let parent_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    // child_pid at offset 44 is the new process's TID which equals its TGID
-    // because it is the main (and only) thread of the new process.
-    let child_tgid: u32 = ctx.read_at(20)?;
+    // child_pid offset is patched at load time from the tracepoint format file.
+    // It equals the new process's TID, which equals its TGID because it is the
+    // main (and only) thread of the new process.
+    let child_tgid: u32 = ctx.read_at(FORK_CHILD_PID_OFFSET as usize)?;
 
     if PID_FILTER.get(&parent_tgid).is_some() {
         if PID_FILTER.insert(&child_tgid, &1u8, 0).is_err() {
@@ -193,13 +209,7 @@ fn emit_fork_event(child_tgid: u32) {
 // ---------------------------------------------------------------------------
 // sys_enter_open  –  legacy open() syscall (x86-64: syscall #2)
 //
-// Tracepoint format:
-//   offset  0-7:   common header
-//   offset  8-15:  __syscall_nr (int + 4-byte padding)
-//   offset 16-23:  filename pointer (const char __user *)   ← arg1
-//   offset 24-31:  flags (long)
-//   offset 32-39:  mode  (long)
-//
+// filename pointer offset is injected via OPEN_FILENAME_OFFSET at load time.
 // NOTE: This tracepoint does not exist on architectures that lack SYS_open
 // (arm64, riscv64, …).  User-space skips attachment gracefully if absent.
 // ---------------------------------------------------------------------------
@@ -212,20 +222,14 @@ pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
 }
 
 unsafe fn try_open(ctx: &TracePointContext) -> Result<u32, i64> {
-    let filename_ptr: u64 = ctx.read_at(16)?;
+    let filename_ptr: u64 = ctx.read_at(OPEN_FILENAME_OFFSET as usize)?;
     emit_open_event(ctx, filename_ptr)
 }
 
 // ---------------------------------------------------------------------------
 // sys_enter_openat  –  openat() syscall (syscall #257 on x86-64)
 //
-// Tracepoint format:
-//   offset  0-7:   common header
-//   offset  8-15:  __syscall_nr (int + padding)
-//   offset 16-23:  dfd     (long)                          ← arg1
-//   offset 24-31:  filename pointer (const char __user *)  ← arg2
-//   offset 32-39:  flags   (long)
-//   offset 40-47:  mode    (long)
+// filename pointer offset is injected via OPENAT_FILENAME_OFFSET at load time.
 // ---------------------------------------------------------------------------
 #[tracepoint]
 pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
@@ -236,21 +240,14 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
 }
 
 unsafe fn try_openat(ctx: &TracePointContext) -> Result<u32, i64> {
-    let filename_ptr: u64 = ctx.read_at(24)?;
+    let filename_ptr: u64 = ctx.read_at(OPENAT_FILENAME_OFFSET as usize)?;
     emit_open_event(ctx, filename_ptr)
 }
 
 // ---------------------------------------------------------------------------
 // sys_enter_openat2  –  openat2() syscall (Linux ≥ 5.6, syscall #437)
 //
-// Tracepoint format:
-//   offset  0-7:   common header
-//   offset  8-15:  __syscall_nr (int + padding)
-//   offset 16-23:  dfd      (long)                         ← arg1
-//   offset 24-31:  pathname pointer (const char __user *)  ← arg2
-//   offset 32-39:  how      (struct open_how * as long)
-//   offset 40-47:  usize    (size_t as long)
-//
+// pathname pointer offset is injected via OPENAT2_FILENAME_OFFSET at load time.
 // NOTE: Attachment fails gracefully on kernels < 5.6.
 // ---------------------------------------------------------------------------
 #[tracepoint]
@@ -262,7 +259,7 @@ pub fn sys_enter_openat2(ctx: TracePointContext) -> u32 {
 }
 
 unsafe fn try_openat2(ctx: &TracePointContext) -> Result<u32, i64> {
-    let filename_ptr: u64 = ctx.read_at(24)?;
+    let filename_ptr: u64 = ctx.read_at(OPENAT2_FILENAME_OFFSET as usize)?;
     emit_open_event(ctx, filename_ptr)
 }
 

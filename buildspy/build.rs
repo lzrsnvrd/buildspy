@@ -10,11 +10,11 @@
 //!    cargo injects, avoiding rustc version mismatches.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ebpf_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../ebpf-component-tracer-ebpf");
+    let ebpf_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../buildspy-ebpf");
 
     aya_build::build_ebpf(
         [aya_build::Package {
-            name: "ebpf-component-tracer-ebpf",
+            name: "buildspy-ebpf",
             root_dir: ebpf_dir,
             no_default_features: false,
             features: &[],

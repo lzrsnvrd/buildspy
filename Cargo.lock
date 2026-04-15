@@ -275,6 +275,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "buildspy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aya",
+ "aya-build",
+ "aya-log",
+ "buildspy-common",
+ "chrono",
+ "clap",
+ "env_logger",
+ "hex",
+ "libc",
+ "log",
+ "nix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+ "uuid",
+]
+
+[[package]]
+name = "buildspy-common"
+version = "0.1.0"
+dependencies = [
+ "aya",
+]
+
+[[package]]
+name = "buildspy-ebpf"
+version = "0.1.0"
+dependencies = [
+ "aya-ebpf",
+ "aya-log-ebpf",
+ "buildspy-common",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -452,46 +492,6 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
-]
-
-[[package]]
-name = "ebpf-component-tracer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aya",
- "aya-build",
- "aya-log",
- "chrono",
- "clap",
- "ebpf-component-tracer-common",
- "env_logger",
- "hex",
- "libc",
- "log",
- "nix",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "toml",
- "uuid",
-]
-
-[[package]]
-name = "ebpf-component-tracer-common"
-version = "0.1.0"
-dependencies = [
- "aya",
-]
-
-[[package]]
-name = "ebpf-component-tracer-ebpf"
-version = "0.1.0"
-dependencies = [
- "aya-ebpf",
- "aya-log-ebpf",
- "ebpf-component-tracer-common",
 ]
 
 [[package]]
