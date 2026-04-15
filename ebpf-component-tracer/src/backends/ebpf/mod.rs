@@ -20,7 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use aya::{
     maps::{HashMap as AyaHashMap, MapData, PerCpuArray, RingBuf},
     programs::TracePoint,
-    Ebpf,
+    Ebpf, EbpfLoader,
 };
 use ebpf_component_tracer_common::{FileEvent, EVENT_KIND_FORK};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -135,7 +135,22 @@ pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession
 // ---------------------------------------------------------------------------
 
 fn load(verbose: bool) -> Result<Ebpf> {
-    let mut bpf = Ebpf::load(EBPF_BYTECODE)
+    // Read kernel tracepoint layouts before loading the eBPF binary so that
+    // the global offset constants inside the binary are patched with values
+    // from /sys/kernel/tracing/events/…/format.  This prevents breakage when
+    // the kernel is upgraded and a struct layout changes (e.g. sched_process_fork
+    // switching comm fields from char[16] to __data_loc, shifting child_pid).
+    let fork_child_pid   = tracepoint_field_offset("sched",    "sched_process_fork",  "child_pid", 20);
+    let open_filename    = tracepoint_field_offset("syscalls", "sys_enter_open",       "filename",  16);
+    let openat_filename  = tracepoint_field_offset("syscalls", "sys_enter_openat",    "filename",  24);
+    let openat2_filename = tracepoint_field_offset("syscalls", "sys_enter_openat2",   "filename",  24);
+
+    let mut bpf = EbpfLoader::new()
+        .set_global("FORK_CHILD_PID_OFFSET",   &fork_child_pid,   true)
+        .set_global("OPEN_FILENAME_OFFSET",    &open_filename,    true)
+        .set_global("OPENAT_FILENAME_OFFSET",  &openat_filename,  true)
+        .set_global("OPENAT2_FILENAME_OFFSET", &openat2_filename, true)
+        .load(EBPF_BYTECODE)
         .context("failed to load eBPF bytecode – are you running as root?")?;
 
     if verbose {
@@ -261,6 +276,83 @@ fn spawn_event_task(
     });
 
     done_rx
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoint format-file helpers
+// ---------------------------------------------------------------------------
+
+/// Return the byte offset of `field_name` inside the `category/event`
+/// tracepoint's raw context buffer.
+///
+/// The format file is read from tracefs (preferred) or debugfs.  If neither
+/// is available, or the field is absent, `default` is returned and a warning
+/// is logged so the operator knows the fallback is in use.
+fn tracepoint_field_offset(category: &str, event: &str, field_name: &str, default: u32) -> u32 {
+    let paths = [
+        format!("/sys/kernel/tracing/events/{category}/{event}/format"),
+        format!("/sys/kernel/debug/tracing/events/{category}/{event}/format"),
+    ];
+
+    for path in &paths {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if let Some(offset) = parse_format_field_offset(&content, field_name) {
+            log::debug!(
+                "tracepoint {category}/{event}: field '{field_name}' → offset {offset} ({})",
+                path
+            );
+            return offset;
+        }
+        log::warn!(
+            "tracepoint {category}/{event}: field '{field_name}' not found in {path}, \
+             using default offset {default}"
+        );
+        return default;
+    }
+
+    log::warn!(
+        "tracepoint {category}/{event}: format file not found (tracefs/debugfs not mounted?), \
+         using default offset {default} for field '{field_name}'"
+    );
+    default
+}
+
+/// Parse a tracepoint format string and return the `offset:` value for the
+/// named field.
+///
+/// Handles both tab-separated layouts (sched events) and space-separated
+/// layouts (syscall events):
+/// ```text
+/// \tfield:pid_t child_pid;\toffset:20;\tsize:4;\tsigned:1;
+///     field:const char * filename;    offset:24;    size:8;    signed:0;
+/// ```
+fn parse_format_field_offset(format: &str, field_name: &str) -> Option<u32> {
+    for line in format.lines() {
+        let line = line.trim();
+        if !line.starts_with("field:") {
+            continue;
+        }
+
+        // Split on semicolons — works for both tab- and space-separated formats.
+        // Each segment is trimmed so leading/trailing whitespace is irrelevant.
+        let parts: Vec<&str> = line.split(';').map(str::trim).collect();
+
+        // parts[0] = "field:TYPE NAME"
+        let decl = parts.first()?.strip_prefix("field:")?;
+        if decl.split_whitespace().last()? != field_name {
+            continue;
+        }
+
+        for part in &parts[1..] {
+            if let Some(val) = part.strip_prefix("offset:") {
+                return val.trim().parse().ok();
+            }
+        }
+    }
+    None
 }
 
 fn read_dropped_count(bpf: &Ebpf) -> u64 {

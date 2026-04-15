@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 /// Extensions relevant for SCA: libraries, headers, and local source files.
 /// Object files (.o) and build-system outputs are excluded.
-const RELEVANT_EXTENSIONS: &[&str] = &["so", "a", "h", "hpp", "hxx", "c", "cpp", "cxx", "cc"];
+const RELEVANT_EXTENSIONS: &[&str] = &["so", "a", "h", "hpp", "hxx", "c"];
 
 /// Path prefixes we consider "system" (package-manager-owned).
 /// NOTE: /usr/local/ is intentionally excluded — files there are manually

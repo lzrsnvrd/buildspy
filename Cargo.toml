@@ -18,9 +18,9 @@ resolver = "2"
 [workspace.package]
 version    = "0.1.0"
 edition    = "2021"
-license    = "MIT"
-authors    = ["ebpf-component-tracer"]
-repository = "https://github.com/example/ebpf-component-tracer"
+license    = "Apache-2.0"
+authors    = ["Danil Valetov"]
+repository = "https://github.com/vltvdnl/build_analyzer"
 
 [profile.dev]
 opt-level = 1
