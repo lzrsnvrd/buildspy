@@ -9,7 +9,6 @@
 //!   * `exit_rx`   – build exit code; resolves only after all events are flushed
 
 pub mod ebpf;
-pub mod proc_watcher;
 pub mod ptrace;
 
 use std::path::Path;

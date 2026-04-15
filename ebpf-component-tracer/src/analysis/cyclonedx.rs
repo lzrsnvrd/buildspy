@@ -9,7 +9,7 @@ use std::{collections::HashMap, fs, path::Path};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::report::Component;
+use super::report::{Component, ComponentType};
 
 // ---------------------------------------------------------------------------
 // OS / distro detection
@@ -224,8 +224,8 @@ pub fn build_bom(report: &ReportRef<'_>, distro: &str) -> Bom {
 }
 
 fn to_cdx_component(c: &Component, distro: &str) -> Option<CdxComponent> {
-    match c.component_type.as_str() {
-        "system_package" => {
+    match c.component_type {
+        ComponentType::SystemPackage => {
             let version = c.version.as_deref().unwrap_or("unknown");
             let purl = if version != "unknown" {
                 Some(system_purl(
@@ -250,7 +250,7 @@ fn to_cdx_component(c: &Component, distro: &str) -> Option<CdxComponent> {
                 }),
             })
         }
-        "local_file" => {
+        ComponentType::LocalFile => {
             let hash_str = c.hash.as_deref().unwrap_or("sha256:error");
             let hex = hash_str.strip_prefix("sha256:").unwrap_or(hash_str);
             let purl = Some(local_purl(&c.name, hash_str));
@@ -270,7 +270,7 @@ fn to_cdx_component(c: &Component, distro: &str) -> Option<CdxComponent> {
                 }),
             })
         }
-        "system_unknown" => Some(CdxComponent {
+        ComponentType::SystemUnknown => Some(CdxComponent {
             bom_ref: None,
             component_type: "library".to_string(),
             name: c.name.clone(),
@@ -281,7 +281,7 @@ fn to_cdx_component(c: &Component, distro: &str) -> Option<CdxComponent> {
                 occurrences: vec![Occurrence { location: c.path.clone() }],
             }),
         }),
-        "ecosystem_package" => {
+        ComponentType::EcosystemPackage => {
             let purl = c.purl.clone();
             Some(CdxComponent {
                 bom_ref: purl.clone(),
@@ -293,7 +293,6 @@ fn to_cdx_component(c: &Component, distro: &str) -> Option<CdxComponent> {
                 evidence: None,
             })
         }
-        _ => None,
     }
 }
 

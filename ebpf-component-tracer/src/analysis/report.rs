@@ -22,6 +22,16 @@ pub struct Report {
     pub components: Vec<Component>,
 }
 
+/// Variant order matches the desired sort order in the output report.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentType {
+    EcosystemPackage,
+    LocalFile,
+    SystemPackage,
+    SystemUnknown,
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 pub struct Component {
     pub name: String,
@@ -38,7 +48,7 @@ pub struct Component {
     pub purl: Option<String>,
     pub path: String,
     #[serde(rename = "type")]
-    pub component_type: String,
+    pub component_type: ComponentType,
 }
 
 // ---------------------------------------------------------------------------
@@ -54,14 +64,13 @@ pub fn collect_components(
     project_dir: &Path,
     engine: &IdentityEngine,
 ) -> HashMap<String, Component> {
-    use crate::backends::proc_watcher;
-    use super::resolver;
+    use super::{filter, resolver};
 
     // Phase 1: drain the channel, filter noise, normalise paths.
     let mut unique_paths: HashSet<String> = HashSet::new();
     while let Ok((raw, opener_pid)) = path_rx.try_recv() {
         let opener_comm = pid_to_comm.get(&opener_pid).map(String::as_str).unwrap_or("");
-        if proc_watcher::is_build_orchestrator(opener_comm) {
+        if filter::is_build_orchestrator(opener_comm) {
             log::debug!("skip ({}): {}", opener_comm, raw);
             continue;
         }
@@ -92,10 +101,10 @@ pub fn collect_components(
             }
         }
 
-        let comp = resolve_component(path_str, path, engine, project_dir);
-        let key = match comp.component_type.as_str() {
-            "system_package" => comp.name.clone(),
-            "system_unknown" => soname_base(&comp.name),
+        let comp = resolve_component(path_str, path, engine);
+        let key = match comp.component_type {
+            ComponentType::SystemPackage => comp.name.clone(),
+            ComponentType::SystemUnknown => soname_base(&comp.name),
             _ => path_str.to_string(),
         };
         components.entry(key).or_insert(comp);
@@ -120,7 +129,6 @@ pub fn resolve_component(
     path_str: &str,
     path: &Path,
     engine: &IdentityEngine,
-    _project_dir: &Path,
 ) -> Component {
     match engine.identify(path) {
         ComponentIdentity::SystemPackage { name, version, arch, src_name } => Component {
@@ -131,7 +139,7 @@ pub fn resolve_component(
             hash: None,
             purl: None,
             path: path_str.to_string(),
-            component_type: "system_package".to_string(),
+            component_type: ComponentType::SystemPackage,
         },
         ComponentIdentity::LocalFile { hash } => {
             let name = path
@@ -148,7 +156,7 @@ pub fn resolve_component(
                 hash: Some(hash),
                 purl: None,
                 path: path_str.to_string(),
-                component_type: "local_file".to_string(),
+                component_type: ComponentType::LocalFile,
             }
         }
         ComponentIdentity::UnknownSystem => {
@@ -165,7 +173,7 @@ pub fn resolve_component(
                 hash: None,
                 purl: None,
                 path: path_str.to_string(),
-                component_type: "system_unknown".to_string(),
+                component_type: ComponentType::SystemUnknown,
             }
         }
     }

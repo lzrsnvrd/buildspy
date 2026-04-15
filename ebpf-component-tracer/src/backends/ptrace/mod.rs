@@ -26,13 +26,14 @@
 //! forked the tracee.  The child is therefore spawned *and* the entire event
 //! loop runs inside a single dedicated `std::thread`.
 
+mod diagnostics;
+mod mem;
 mod seccomp;
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("the ptrace backend currently only supports x86_64");
 
 use std::{
-    io::{Read, Seek, SeekFrom},
     os::{raw::c_int, unix::process::CommandExt},
     path::{Path, PathBuf},
     sync::{
@@ -461,7 +462,7 @@ fn ptrace_loop(
                     // the key argument so we can see what the process blocks on.
                     let syscall_raw = std::fs::read_to_string(format!("/proc/{pid}/syscall"))
                         .unwrap_or_default();
-                    let syscall_info = decode_syscall_line(syscall_raw.trim());
+                    let syscall_info = diagnostics::decode_syscall_line(syscall_raw.trim());
 
                     log::warn!(
                         "  PID {pid} (ppid={ppid}): comm={}, wchan={}, syscall=[{}]",
@@ -500,7 +501,7 @@ fn ptrace_loop(
                 // parent would block in pselect6 forever because no second SIGCHLD
                 // is ever delivered once we process the Exited event.
                 let parent_pid = child_to_parent.remove(&pid_u32).or_else(|| {
-                    let ppid = read_ppid(pid_u32);
+                    let ppid = mem::read_ppid(pid_u32);
                     if ppid.is_some() {
                         log::debug!(
                             "ptrace: Exited({pid}) — FORK race: child_to_parent empty, \
@@ -540,7 +541,7 @@ fn ptrace_loop(
                 // Same SIGCHLD re-delivery as for Exited (including the FORK
                 // race fallback via read_ppid).
                 let parent_pid = child_to_parent.remove(&pid_u32).or_else(|| {
-                    let ppid = read_ppid(pid_u32);
+                    let ppid = mem::read_ppid(pid_u32);
                     if ppid.is_some() {
                         log::debug!(
                             "ptrace: Signaled({pid}) — FORK race: child_to_parent empty, \
@@ -596,7 +597,7 @@ fn ptrace_loop(
                             );
                         }
                         if regs.orig_rax == OPENAT_NR {
-                            emit_path(&path_tx, pid_u32, regs.rsi);
+                            mem::emit_path(&path_tx, pid_u32, regs.rsi);
                         }
                     } else {
                         log::debug!("ptrace: PtraceSyscall({pid}) ENTRY (getregs failed)");
@@ -667,7 +668,7 @@ fn ptrace_loop(
                             // verify so a future filter extension doesn't silently
                             // misinterpret other syscalls.
                             if regs.orig_rax == OPENAT_NR {
-                                emit_path(&path_tx, pid_u32, regs.rsi);
+                                mem::emit_path(&path_tx, pid_u32, regs.rsi);
                             } else {
                                 log::debug!(
                                     "ptrace: SECCOMP stop for unexpected syscall {} on PID {pid}",
@@ -751,162 +752,3 @@ fn ptrace_loop(
     let _ = exit_tx.send(exit_code);
 }
 
-// ---------------------------------------------------------------------------
-// Syscall decoder for watchdog diagnostics
-// ---------------------------------------------------------------------------
-
-/// Parse a `/proc/{pid}/syscall` line and return a human-readable summary.
-///
-/// Kernel format: `nr arg0 arg1 arg2 arg3 arg4 arg5 sp pc`
-/// where `nr` is written as a plain **decimal** integer and `argN` as `0x`-prefixed hex.
-/// Returns `"running"` if the process is not currently blocked in a syscall.
-fn decode_syscall_line(raw: &str) -> String {
-    if raw == "running" || raw.is_empty() {
-        return "running".into();
-    }
-
-    let parts: Vec<&str> = raw.split_ascii_whitespace().collect();
-    if parts.is_empty() {
-        return raw.to_string();
-    }
-
-    // The kernel writes the syscall number as a plain decimal integer (no 0x prefix).
-    // Parse as decimal first; fall back to hex for any non-standard kernels.
-    let nr = parts[0]
-        .parse::<u64>()
-        .or_else(|_| u64::from_str_radix(parts[0].trim_start_matches("0x"), 16))
-        .unwrap_or(u64::MAX);
-
-    // Retrieve the n-th syscall argument (0-based).  Arguments occupy parts[1..],
-    // since parts[0] is the syscall number.  All argument values are hex in the file.
-    let arg = |n: usize| -> u64 {
-        parts
-            .get(n + 1)
-            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            .unwrap_or(0)
-    };
-
-    match nr {
-        // wait4(pid, wstatus, options, rusage)
-        61 => {
-            let wait_pid = arg(0) as i64;
-            format!("wait4(pid={wait_pid})")
-        }
-        // waitid(idtype, id, infop, options, rusage)
-        247 => {
-            let id = arg(1) as i64;
-            format!("waitid(id={id})")
-        }
-        // poll(fds, nfds, timeout_ms)
-        7 => {
-            let nfds    = arg(1);
-            let timeout = arg(2) as i64; // -1 = infinite
-            if timeout < 0 {
-                format!("poll(nfds={nfds}, timeout=∞)")
-            } else {
-                format!("poll(nfds={nfds}, timeout={timeout}ms)")
-            }
-        }
-        // ppoll(fds, nfds, tmo_p, sigmask, sigsetsize)
-        271 => {
-            let nfds    = arg(1);
-            let tmo_ptr = arg(2); // NULL pointer = infinite timeout
-            if tmo_ptr == 0 {
-                format!("ppoll(nfds={nfds}, timeout=∞)")
-            } else {
-                format!("ppoll(nfds={nfds})")
-            }
-        }
-        // select(nfds, readfds, writefds, exceptfds, timeout)
-        23 => format!("select(nfds={})", arg(0)),
-        // pselect6(nfds, readfds, writefds, exceptfds, timeout_p, sigmask)
-        270 => {
-            let nfds    = arg(0);
-            let tmo_ptr = arg(4); // NULL pointer = infinite timeout
-            if tmo_ptr == 0 {
-                format!("pselect6(nfds={nfds}, timeout=∞)")
-            } else {
-                format!("pselect6(nfds={nfds})")
-            }
-        }
-        // epoll_wait(epfd, events, maxevents, timeout_ms)
-        // epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask, sigsetsize)
-        // epoll_pwait2(epfd, events, maxevents, timeout_ts, sigmask)
-        232 | 281 | 441 => {
-            let timeout = arg(3) as i64; // arg3 = timeout_ms (-1 = infinite)
-            if timeout < 0 {
-                "epoll_wait(timeout=∞)".into()
-            } else {
-                format!("epoll_wait(timeout={timeout}ms)")
-            }
-        }
-        // futex(uaddr, futex_op, val, ...)
-        202 => format!("futex(op=0x{:x})", arg(1)),
-        // read(fd, buf, count)
-        0 => format!("read(fd={})", arg(0)),
-        // nanosleep / clock_nanosleep
-        35 | 230 => "nanosleep".into(),
-        _ => format!("syscall#{nr}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PPid lookup
-// ---------------------------------------------------------------------------
-
-/// Read the parent PID (`PPid:` field) from `/proc/{pid}/status`.
-///
-/// Called from the `Exited`/`Signaled` handlers as a fallback for the race
-/// where the child exits before the parent's `PTRACE_EVENT_FORK/CLONE/VFORK`
-/// is processed, leaving `child_to_parent` without an entry.  At the time of
-/// the call the child has just transitioned from ptrace-zombie to regular
-/// zombie, so `/proc/{pid}/status` is still readable.
-fn read_ppid(pid: u32) -> Option<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("PPid:") {
-            return rest.trim().parse::<u32>().ok();
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// Path reading
-// ---------------------------------------------------------------------------
-
-/// Read the `openat` pathname argument from the stopped tracee's memory and
-/// send it on `path_tx`.  `ptr` is the value of the `rsi` register.
-fn emit_path(path_tx: &UnboundedSender<(String, u32)>, pid: u32, ptr: u64) {
-    if let Some(path) = read_path_from_mem(pid, ptr) {
-        if !path.is_empty() {
-            let _ = path_tx.send((path, pid));
-        }
-    }
-}
-
-/// Read a null-terminated string from a ptrace-stopped process's virtual
-/// memory via `/proc/<pid>/mem`.  The process is stopped, so the read is
-/// race-free.
-fn read_path_from_mem(pid: u32, ptr: u64) -> Option<String> {
-    if ptr == 0 {
-        return None;
-    }
-
-    let mem_path = format!("/proc/{pid}/mem");
-    let mut file = std::fs::File::open(&mem_path).ok()?;
-    file.seek(SeekFrom::Start(ptr)).ok()?;
-
-    let mut buf = [0u8; 4096];
-    let n = file.read(&mut buf).ok()?;
-    if n == 0 {
-        return None;
-    }
-
-    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
-    if end == 0 {
-        return None;
-    }
-
-    String::from_utf8(buf[..end].to_vec()).ok()
-}

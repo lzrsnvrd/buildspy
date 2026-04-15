@@ -11,6 +11,7 @@
 mod analysis;
 mod backends;
 mod ecosystem;
+mod proc_info;
 
 use std::{collections::HashMap, env, path::PathBuf};
 
@@ -21,7 +22,7 @@ use clap::Parser;
 use analysis::{
     cyclonedx,
     identity::IdentityEngine,
-    report::{Component, Report},
+    report::{Component, ComponentType, Report},
 };
 use backends::{Backend, TracingSession};
 
@@ -102,12 +103,10 @@ async fn main() -> Result<()> {
     let exit_code = loop {
         tokio::select! {
             Some(pid) = session.new_pid_rx.recv() => {
-                let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-                    .unwrap_or_default();
-                let comm = comm.trim().to_string();
+                let comm = proc_info::read_comm(pid);
                 log::debug!("Tracking PID {} ({})", pid, comm);
                 pid_to_comm.insert(pid, comm);
-                if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                if let Some(cwd) = proc_info::read_cwd(pid) {
                     pid_to_cwd.insert(pid, cwd);
                 }
             }
@@ -132,14 +131,12 @@ async fn main() -> Result<()> {
         }
     };
 
-    while let Ok(pid) = session.new_pid_rx.try_recv() {                                                                                                                                                                                                   
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))                                                                                                                                                                                   
-            .unwrap_or_default().trim().to_string();                   
-        pid_to_comm.insert(pid, comm);                                                                                                                                                                                                                    
-        if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
-            pid_to_cwd.insert(pid, cwd);                                                                                                                                                                                                                  
-        }                               
-    } 
+    while let Ok(pid) = session.new_pid_rx.try_recv() {
+        pid_to_comm.insert(pid, proc_info::read_comm(pid));
+        if let Some(cwd) = proc_info::read_cwd(pid) {
+            pid_to_cwd.insert(pid, cwd);
+        }
+    }
 
     // ------------------------------------------------------------------
     // Post-build analysis: resolve paths → components + ecosystem scan.
@@ -165,7 +162,7 @@ async fn main() -> Result<()> {
             hash: None,
             purl: Some(c.purl),
             path: format!("ecosystem:{}", c.ecosystem),
-            component_type: "ecosystem_package".to_string(),
+            component_type: ComponentType::EcosystemPackage,
         });
     }
 
@@ -173,9 +170,7 @@ async fn main() -> Result<()> {
     // Build, sort and write the reports.
     // ------------------------------------------------------------------
     let mut component_list: Vec<Component> = components.into_values().collect();
-    component_list.sort_by(|a, b| {
-        a.component_type.cmp(&b.component_type).then(a.name.cmp(&b.name))
-    });
+    component_list.sort_by(|a, b| a.component_type.cmp(&b.component_type).then(a.name.cmp(&b.name)));
 
     let report = Report {
         timestamp: Utc::now().to_rfc3339(),
