@@ -17,7 +17,7 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::debug;
 use aya_log_ebpf::info;
-use ebpf_component_tracer_common::{FileEvent, MAX_FILENAME_LEN};
+use ebpf_component_tracer_common::{FileEvent, MAX_FILENAME_LEN, EVENT_KIND_FORK, EVENT_KIND_OPEN};
 
 // ---------------------------------------------------------------------------
 // Maps
@@ -38,7 +38,7 @@ static DROPPED_EVENTS: PerCpuArray<u32> = PerCpuArray::with_max_entries(1, 0);
 
 /// Per-CPU counter of PID_FILTER insert failures in the fork tracepoint.
 /// A non-zero value means some child processes were not tracked immediately;
-/// proc_watcher serves as a fallback but with ~5 ms latency.
+/// early openat calls from those processes may have been missed.
 #[map]
 static FAILED_PID_INSERTS: PerCpuArray<u32> = PerCpuArray::with_max_entries(1, 0);
 
@@ -47,10 +47,15 @@ static FAILED_PID_INSERTS: PerCpuArray<u32> = PerCpuArray::with_max_entries(1, 0
 //
 // Tracepoint format (from /sys/kernel/tracing/events/sched/sched_process_fork):
 //   offset  0-7:   common header  (u16 type, u8 flags, u8 preempt, i32 pid)
-//   offset  8-23:  parent_comm[16]
-//   offset 24-27:  parent_pid (pid_t / i32)
-//   offset 28-43:  child_comm[16]
-//   offset 44-47:  child_pid (pid_t / i32)
+//   offset  8-11:  parent_comm  __data_loc char[]  (4-byte encoded ref, NOT char[16])
+//   offset 12-15:  parent_pid (pid_t / i32)
+//   offset 16-19:  child_comm   __data_loc char[]  (4-byte encoded ref)
+//   offset 20-23:  child_pid (pid_t / i32)
+//
+// NOTE: On modern kernels comm fields use __data_loc (a 4-byte reference to
+// a dynamic string appended after the fixed fields), not a fixed char[16].
+// This is verified via:
+//   cat /sys/kernel/tracing/events/sched/sched_process_fork/format
 // ---------------------------------------------------------------------------
 #[tracepoint]
 pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
@@ -76,18 +81,22 @@ unsafe fn try_fork(ctx: &TracePointContext) -> Result<u32, i64> {
     let parent_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     // child_pid at offset 44 is the new process's TID which equals its TGID
     // because it is the main (and only) thread of the new process.
-    let child_tgid: u32 = ctx.read_at(44)?;
+    let child_tgid: u32 = ctx.read_at(20)?;
 
     if PID_FILTER.get(&parent_tgid).is_some() {
         if PID_FILTER.insert(&child_tgid, &1u8, 0).is_err() {
             // Insert failed (map full or BPF runtime error).  Count it so
-            // user-space can warn; proc_watcher will recover with ~5 ms delay.
+            // user-space can warn about missed early openat calls.
             info!(ctx, "problems with inserting in PID_FILTER");
             if let Some(c) = FAILED_PID_INSERTS.get_ptr_mut(0) {
                 *c += 1;
             }
         } else {
             debug!(ctx, "fork: tracking child {} (parent tgid {})", child_tgid, parent_tgid);
+            // Emit a fork event so user-space can immediately read
+            // /proc/<child>/comm and /proc/<child>/cwd while the child is
+            // guaranteed to be alive.
+            emit_fork_event(child_tgid);
         }
     }
     Ok(0)
@@ -140,6 +149,8 @@ unsafe fn emit_open_event(_ctx: &TracePointContext, filename_ptr: u64) -> Result
     let event = &mut *entry.as_mut_ptr();
     event.pid = tgid;
     event.filename_len = 0;
+    event.kind = EVENT_KIND_OPEN;
+    event._pad = [0u8; 3];
 
     let dest = core::slice::from_raw_parts_mut(event.filename.as_mut_ptr(), MAX_FILENAME_LEN);
     match bpf_probe_read_user_str_bytes(filename_ptr as *const u8, dest) {
@@ -153,6 +164,30 @@ unsafe fn emit_open_event(_ctx: &TracePointContext, filename_ptr: u64) -> Result
     }
 
     Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// emit_fork_event  –  write a EVENT_KIND_FORK record into the ring buffer
+//
+// Called from sched_process_fork after a successful PID_FILTER insert.
+// User-space uses this signal to read /proc/<child>/comm and /proc/<child>/cwd
+// while the child is guaranteed to be alive (it hasn't run yet).
+// ---------------------------------------------------------------------------
+#[inline(always)]
+fn emit_fork_event(child_tgid: u32) {
+    let Some(mut entry) = FILE_EVENTS.reserve::<FileEvent>(0) else {
+        return;
+    };
+    // Safety: entry points to reserved ring-buffer memory sized for FileEvent.
+    // All bytes must be written before submit — BPF verifier requires this to
+    // prevent information leaks from uninitialized kernel memory.
+    let event = unsafe { &mut *entry.as_mut_ptr() };
+    event.pid = child_tgid;
+    event.filename_len = 0;
+    event.kind = EVENT_KIND_FORK;
+    event._pad = [0u8; 3];
+    event.filename = [0u8; MAX_FILENAME_LEN];
+    entry.submit(0);
 }
 
 // ---------------------------------------------------------------------------

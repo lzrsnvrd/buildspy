@@ -6,6 +6,7 @@
 //! Public surface: `start()` which returns a `TracingSession`.
 
 use std::{
+    collections::HashSet,
     os::unix::io::AsRawFd,
     path::Path,
     sync::{
@@ -21,7 +22,7 @@ use aya::{
     programs::TracePoint,
     Ebpf,
 };
-use ebpf_component_tracer_common::FileEvent;
+use ebpf_component_tracer_common::{FileEvent, EVENT_KIND_FORK};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use super::TracingSession;
@@ -64,32 +65,18 @@ pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession
     pid_filter_insert(&mut bpf, child_pid)?;
     pid_filter_remove(&mut bpf, our_tgid);
 
-    // Move bpf into an Arc so the PID-fanout task and the exit/cleanup task
-    // can both use it without duplicating the handle.
+    // Move bpf into an Arc for the exit/cleanup task.
     let bpf = Arc::new(Mutex::new(bpf));
 
-    // Ring-buffer event task.
+    // PID metadata channel: the drain thread sends child PIDs discovered via
+    // Fork events (and lazily on first Open from an unknown PID).  main uses
+    // these to read /proc/<pid>/comm and /proc/<pid>/cwd.
+    let (new_pid_tx, new_pid_rx) = unbounded_channel::<u32>();
+
+    // Ring-buffer event task: drains FILE_EVENTS, handles Fork/Open events.
     let (path_tx, path_rx) = unbounded_channel::<(String, u32)>();
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let drain_done_rx = spawn_event_task(ring_buf, path_tx, Arc::clone(&stop_flag));
-
-    // PID tracking: proc_watcher discovers new children; a fan-out task inserts
-    // them into the eBPF PID filter AND forwards them to the external channel.
-    let (int_pid_tx, mut int_pid_rx) = unbounded_channel::<u32>();
-    let (new_pid_tx, new_pid_rx) = unbounded_channel::<u32>();
-    tokio::spawn(super::proc_watcher::watch_children(child_pid, int_pid_tx));
-
-    let bpf_for_pids = Arc::clone(&bpf);
-    tokio::spawn(async move {
-        while let Some(pid) = int_pid_rx.recv().await {
-            if let Ok(mut b) = bpf_for_pids.lock() {
-                if let Err(e) = pid_filter_insert(&mut b, pid) {
-                    log::warn!("eBPF: failed to track PID {pid}: {e}");
-                }
-            }
-            let _ = new_pid_tx.send(pid);
-        }
-    });
+    let drain_done_rx = spawn_event_task(ring_buf, path_tx, new_pid_tx, Arc::clone(&stop_flag));
 
     // Exit task: wait for the child, flush the ring buffer, then signal done.
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<Option<i32>>();
@@ -130,8 +117,7 @@ pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession
             if failed > 0 {
                 log::warn!(
                     "eBPF PID_FILTER: failed to insert {failed} PID(s) during fork — \
-                     those processes were not tracked immediately. proc_watcher provided \
-                     ~5 ms delayed fallback, but early openat calls may have been missed."
+                     those processes were not tracked; early openat calls may have been missed."
                 );
             }
         }
@@ -227,19 +213,30 @@ pub fn pid_filter_remove(bpf: &mut Ebpf, pid: u32) {
 
 /// Drains the ring buffer on a dedicated OS thread using `libc::poll`.
 ///
+/// Handles two event kinds from `FILE_EVENTS`:
+/// * `EVENT_KIND_FORK` — emitted by `sched_process_fork` after a successful
+///   `PID_FILTER` insert.  The child is guaranteed alive at this point, so we
+///   immediately notify `new_pid_tx`; main reads `/proc/<pid>/comm` and
+///   `/proc/<pid>/cwd` while the child is still running.
+/// * `EVENT_KIND_OPEN` (default) — a file-open event.  If the opener PID has
+///   not been seen before (multi-core race: child ran before the fork tracepoint
+///   fired), we lazily send it to `new_pid_tx` as well; the child is guaranteed
+///   alive because it just called openat.
+///
 /// Returns a oneshot `Receiver` that resolves when the thread has fully
-/// finished its final drain and dropped `path_tx`.  The exit task must
-/// `.await` this before sending `exit_tx` so that `collect_components`
-/// (which uses `try_recv`) sees every event already in the channel.
+/// finished its final drain.  The exit task must `.await` this before sending
+/// `exit_tx`.
 fn spawn_event_task(
     ring_buf: RingBuf<MapData>,
     path_tx: UnboundedSender<(String, u32)>,
+    new_pid_tx: UnboundedSender<u32>,
     stop: Arc<AtomicBool>,
 ) -> tokio::sync::oneshot::Receiver<()> {
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
     std::thread::spawn(move || {
         let mut ring_buf = ring_buf;
+        let mut known_pids: HashSet<u32> = HashSet::new();
         let fd = ring_buf.as_raw_fd();
 
         loop {
@@ -248,17 +245,17 @@ fn spawn_event_task(
             let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
             unsafe { libc::poll(&mut pfd, 1, 10) };
 
-            drain_ring_buf(&mut ring_buf, &path_tx);
+            drain_ring_buf(&mut ring_buf, &path_tx, &new_pid_tx, &mut known_pids);
 
             if stop.load(Ordering::Acquire) {
                 // Final drain after stop signal — catches events that arrived
                 // in the 300 ms window after the build exited.
-                drain_ring_buf(&mut ring_buf, &path_tx);
+                drain_ring_buf(&mut ring_buf, &path_tx, &new_pid_tx, &mut known_pids);
                 break;
             }
         }
 
-        // path_tx is dropped here, closing the channel.
+        // Both senders are dropped here, closing their channels.
         // done_tx signals the exit task that all events have been sent.
         let _ = done_tx.send(());
     });
@@ -280,14 +277,43 @@ fn read_failed_pid_inserts(bpf: &Ebpf) -> u64 {
     values.iter().map(|v| *v as u64).sum()
 }
 
-fn drain_ring_buf(rb: &mut RingBuf<MapData>, tx: &UnboundedSender<(String, u32)>) {
+fn drain_ring_buf(
+    rb: &mut RingBuf<MapData>,
+    path_tx: &UnboundedSender<(String, u32)>,
+    new_pid_tx: &UnboundedSender<u32>,
+    known_pids: &mut HashSet<u32>,
+) {
+    let mut n_fork = 0u64;
+    let mut n_open = 0u64;
+
     while let Some(item) = rb.next() {
-        let len = std::mem::size_of::<FileEvent>();
-        if item.len() < len {
+        if item.len() < std::mem::size_of::<FileEvent>() {
+            log::warn!("eBPF drain: short item ({} bytes, expected {}), skipping",
+                item.len(), std::mem::size_of::<FileEvent>());
             continue;
         }
         // Safety: eBPF always writes a complete FileEvent.
         let event: &FileEvent = unsafe { &*(item.as_ptr() as *const FileEvent) };
+
+        if event.kind == EVENT_KIND_FORK {
+            n_fork += 1;
+            // Child is alive right now (fork tracepoint fires before child runs).
+            // Notify main so it can read /proc/<pid>/comm and /proc/<pid>/cwd.
+            if known_pids.insert(event.pid) {
+                let _ = new_pid_tx.send(event.pid);
+            }
+            continue;
+        }
+
+        n_open += 1;
+        // EVENT_KIND_OPEN (or any unknown kind treated as open).
+        // If we haven't seen this PID before, the fork event either hasn't
+        // arrived yet (multi-core race) or was never emitted (PID_FILTER
+        // insert failed).  The process is alive right now — it just called
+        // openat — so notify main for lazy metadata resolution.
+        if known_pids.insert(event.pid) {
+            let _ = new_pid_tx.send(event.pid);
+        }
 
         let filename_len =
             (event.filename_len as usize).min(ebpf_component_tracer_common::MAX_FILENAME_LEN);
@@ -299,7 +325,11 @@ fn drain_ring_buf(rb: &mut RingBuf<MapData>, tx: &UnboundedSender<(String, u32)>
         };
 
         if !raw.is_empty() {
-            let _ = tx.send((raw, event.pid));
+            let _ = path_tx.send((raw, event.pid));
         }
+    }
+
+    if n_fork + n_open > 0 {
+        log::debug!("eBPF drain: {} fork + {} open events", n_fork, n_open);
     }
 }
