@@ -253,12 +253,22 @@ fn to_cdx_component(c: &Component, distro: &str) -> Option<CdxComponent> {
         ComponentType::LocalFile => {
             let hash_str = c.hash.as_deref().unwrap_or("sha256:error");
             let hex = hash_str.strip_prefix("sha256:").unwrap_or(hash_str);
-            let purl = Some(local_purl(&c.name, hash_str));
+            // If we have a real upstream version (not a hash), generate a
+            // proper versioned PURL and record the SHA-256 in `hashes`.
+            // Otherwise fall back to the hash-as-version form.
+            let (version_field, purl) = match &c.version {
+                Some(ver) => {
+                    let p = format!("pkg:generic/{}@{}", c.name, purl_encode(ver));
+                    (ver.clone(), p)
+                }
+                None => (hash_str.to_string(), local_purl(&c.name, hash_str)),
+            };
+            let purl = Some(purl);
             Some(CdxComponent {
                 bom_ref: purl.clone(),
                 component_type: "library".to_string(),
                 name: c.name.clone(),
-                version: Some(hash_str.to_string()),
+                version: Some(version_field),
                 purl,
                 hashes: if hex != "error" {
                     vec![CdxHash { alg: "SHA-256".to_string(), content: hex.to_string() }]

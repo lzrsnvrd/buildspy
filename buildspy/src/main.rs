@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
     // ------------------------------------------------------------------
     // Post-build analysis: resolve paths → components + ecosystem scan.
     // ------------------------------------------------------------------
-    let engine = IdentityEngine::new();
+    let engine = IdentityEngine::new(&project_dir);
     let mut components = analysis::report::collect_components(
         &mut session.path_rx,
         &pid_to_comm,
@@ -161,6 +161,7 @@ async fn main() -> Result<()> {
             src_name: None,
             hash: None,
             purl: Some(c.purl),
+            vcs_url: None,
             path: format!("ecosystem:{}", c.ecosystem),
             component_type: ComponentType::EcosystemPackage,
         });

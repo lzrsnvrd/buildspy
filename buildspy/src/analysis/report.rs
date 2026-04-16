@@ -46,6 +46,10 @@ pub struct Component {
     /// Pre-computed PURL for ecosystem_package components.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub purl: Option<String>,
+    /// VCS or download URL for vendored subproject components (e.g. from a
+    /// Meson `.wrap` file).  Absent for system packages and bare local files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vcs_url: Option<String>,
     pub path: String,
     #[serde(rename = "type")]
     pub component_type: ComponentType,
@@ -138,23 +142,26 @@ pub fn resolve_component(
             src_name,
             hash: None,
             purl: None,
+            vcs_url: None,
             path: path_str.to_string(),
             component_type: ComponentType::SystemPackage,
         },
-        ComponentIdentity::LocalFile { hash } => {
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.strip_prefix("lib").unwrap_or(s))
-                .unwrap_or("unknown")
-                .to_string();
+        ComponentIdentity::LocalFile { hash, name_hint, version_hint, vcs_url } => {
+            let name = name_hint.unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.strip_prefix("lib").unwrap_or(s))
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
             Component {
                 name,
-                version: None,
+                version: version_hint,
                 arch: None,
                 src_name: None,
                 hash: Some(hash),
                 purl: None,
+                vcs_url,
                 path: path_str.to_string(),
                 component_type: ComponentType::LocalFile,
             }
@@ -172,6 +179,7 @@ pub fn resolve_component(
                 src_name: None,
                 hash: None,
                 purl: None,
+                vcs_url: None,
                 path: path_str.to_string(),
                 component_type: ComponentType::SystemUnknown,
             }

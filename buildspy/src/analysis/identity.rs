@@ -4,6 +4,9 @@
 //!  * **System paths** (`/usr/`, `/lib/`, …) → query the local package manager
 //!    and return package name + version.
 //!  * **Local paths** → compute a SHA-256 hash as a stable identifier.
+//!    For files inside a Meson `subprojects/` directory the engine also
+//!    enriches the identity with name, version, and VCS URL extracted from
+//!    the corresponding `.wrap` file.
 //!
 //! For dpkg systems the database is read directly from
 //! `/var/lib/dpkg/info/*.list` and `/var/lib/dpkg/status` at startup,
@@ -42,8 +45,18 @@ pub enum ComponentIdentity {
         src_name: Option<String>,
     },
     /// Local / vendored file; identified by SHA-256.
+    ///
+    /// `name_hint`, `version_hint`, and `vcs_url` are populated when the
+    /// file is recognized as part of a Meson subproject (via `.wrap` metadata
+    /// or directory-name heuristics).
     LocalFile {
         hash: String,
+        /// Library name from the `.wrap` file or directory-name heuristic.
+        name_hint: Option<String>,
+        /// Upstream version from `revision`/`directory` in the `.wrap` file.
+        version_hint: Option<String>,
+        /// VCS or download URL from the `.wrap` file, if present.
+        vcs_url: Option<String>,
     },
     /// Path exists on a system prefix but the package manager couldn't
     /// identify it (e.g. manually installed file).
@@ -202,6 +215,206 @@ impl DpkgIndex {
 }
 
 // ---------------------------------------------------------------------------
+// MesonSubprojectIndex – identify vendored subprojects by their .wrap files
+// ---------------------------------------------------------------------------
+
+/// Metadata extracted from a single Meson wrap file.
+struct SubprojectEntry {
+    /// Canonical library name (wrap filename stem, e.g. `"zlib"`).
+    name: String,
+    /// Upstream version, if determinable.
+    version: Option<String>,
+    /// VCS or download URL from the wrap file.
+    vcs_url: Option<String>,
+}
+
+/// Index built from `<project_dir>/subprojects/*.wrap` at startup.
+///
+/// Lookup: given any file path, find `subprojects/<dirname>/` as a component
+/// and return the matching `SubprojectEntry`.
+struct MesonSubprojectIndex {
+    /// Maps the subproject directory name (e.g. `"zlib-1.3.1"`) to its entry.
+    by_dirname: HashMap<String, SubprojectEntry>,
+}
+
+impl MesonSubprojectIndex {
+    fn load(project_dir: &Path) -> Self {
+        let wrap_dir = project_dir.join("subprojects");
+        let mut by_dirname: HashMap<String, SubprojectEntry> = HashMap::new();
+
+        let Ok(entries) = fs::read_dir(&wrap_dir) else {
+            return Self { by_dirname };
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("wrap") {
+                continue;
+            }
+            let wrap_name = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let Ok(content) = fs::read_to_string(&path) else { continue };
+
+            let parsed = parse_wrap_file(&content);
+            // The directory the subproject unpacks into; fall back to wrap name.
+            let dirname = parsed.directory
+                .as_deref()
+                .unwrap_or(&wrap_name)
+                .to_string();
+
+            // Version: prefer revision tag, then directory-name heuristic.
+            let version = parsed.revision
+                .as_deref()
+                .and_then(version_from_revision)
+                .or_else(|| version_from_dirname(&dirname));
+
+            let vcs_url = parsed.url.or(parsed.source_url);
+
+            log::debug!(
+                "meson wrap: {} dir={} ver={:?} url={:?}",
+                wrap_name, dirname, version, vcs_url
+            );
+
+            by_dirname.insert(dirname, SubprojectEntry {
+                name: wrap_name,
+                version,
+                vcs_url,
+            });
+        }
+
+        log::debug!("MesonSubprojectIndex: {} subprojects", by_dirname.len());
+        Self { by_dirname }
+    }
+
+    /// Returns the `SubprojectEntry` if `path` lives inside a known
+    /// `subprojects/<dirname>/` directory (at any nesting level).
+    fn lookup(&self, path: &Path) -> Option<&SubprojectEntry> {
+        let components: Vec<_> = path.components().collect();
+        for i in 0..components.len().saturating_sub(1) {
+            if components[i].as_os_str() == "subprojects" {
+                let dirname = components[i + 1].as_os_str().to_str()?;
+                if let Some(entry) = self.by_dirname.get(dirname) {
+                    return Some(entry);
+                }
+                // Not in the wrap index — try directory-name heuristic.
+                // We return a synthetic entry stored inline below.
+            }
+        }
+        None
+    }
+
+    /// Like `lookup`, but also applies the directory-name heuristic for
+    /// subprojects that have no `.wrap` file (e.g. git submodules).
+    fn lookup_with_fallback(&self, path: &Path) -> Option<(String, Option<String>, Option<String>)> {
+        if let Some(entry) = self.lookup(path) {
+            return Some((entry.name.clone(), entry.version.clone(), entry.vcs_url.clone()));
+        }
+        // Heuristic: find subprojects/<dirname>/ in path and parse dirname.
+        let components: Vec<_> = path.components().collect();
+        for i in 0..components.len().saturating_sub(1) {
+            if components[i].as_os_str() == "subprojects" {
+                let dirname = components[i + 1].as_os_str().to_str()?;
+                let version = version_from_dirname(dirname);
+                let name = name_from_dirname(dirname).to_string();
+                return Some((name, version, None));
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// .wrap file parser (simple INI)
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct ParsedWrap {
+    directory: Option<String>,
+    /// git URL (wrap-git)
+    url: Option<String>,
+    /// git tag or commit (wrap-git)
+    revision: Option<String>,
+    /// download URL (wrap-file)
+    source_url: Option<String>,
+}
+
+fn parse_wrap_file(content: &str) -> ParsedWrap {
+    let mut out = ParsedWrap::default();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') || line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            let key = key.trim();
+            let val = val.trim();
+            match key {
+                "directory"  => out.directory   = Some(val.to_string()),
+                "url"        => out.url          = Some(val.to_string()),
+                "revision"   => out.revision     = Some(val.to_string()),
+                "source_url" => out.source_url   = Some(val.to_string()),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Version / name helpers
+// ---------------------------------------------------------------------------
+
+/// Extract version from a revision field like `"v1.3.1"`, `"1.3.1"`.
+/// Returns `None` for bare commit hashes.
+fn version_from_revision(revision: &str) -> Option<String> {
+    let v = revision.trim_start_matches('v');
+    if looks_like_version(v) { Some(v.to_string()) } else { None }
+}
+
+/// Extract version from a directory name like `"zlib-1.3.1"` → `"1.3.1"`.
+fn version_from_dirname(dirname: &str) -> Option<String> {
+    // Find the rightmost '-' whose suffix looks like a version number.
+    let mut last = None;
+    for (i, c) in dirname.char_indices() {
+        if c == '-' {
+            last = Some(i);
+        }
+    }
+    let idx = last?;
+    let candidate = &dirname[idx + 1..];
+    if looks_like_version(candidate) { Some(candidate.to_string()) } else { None }
+}
+
+/// Strip the version suffix to recover the library name.
+/// `"zlib-1.3.1"` → `"zlib"`, `"openssl-3.0.7"` → `"openssl"`.
+/// Falls back to the full dirname if no version suffix is found.
+fn name_from_dirname(dirname: &str) -> &str {
+    let mut last = None;
+    for (i, c) in dirname.char_indices() {
+        if c == '-' {
+            last = Some(i);
+        }
+    }
+    if let Some(idx) = last {
+        let candidate = &dirname[idx + 1..];
+        if looks_like_version(candidate) {
+            return &dirname[..idx];
+        }
+    }
+    dirname
+}
+
+/// Returns `true` if `s` looks like a semver/version string (starts with a
+/// digit, contains only digits, dots, hyphens, and plus signs).
+fn looks_like_version(s: &str) -> bool {
+    !s.is_empty()
+        && s.starts_with(|c: char| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+')
+}
+
+// ---------------------------------------------------------------------------
 // IdentityEngine
 // ---------------------------------------------------------------------------
 
@@ -209,18 +422,20 @@ impl DpkgIndex {
 pub struct IdentityEngine {
     pkg_manager: PackageManager,
     dpkg_index: Option<DpkgIndex>,
+    meson_index: MesonSubprojectIndex,
     cache: Mutex<HashMap<String, Option<(String, String, Option<String>, Option<String>)>>>,
 }
 
 impl IdentityEngine {
-    pub fn new() -> Self {
+    pub fn new(project_dir: &Path) -> Self {
         let pkg_manager = detect_package_manager();
         let dpkg_index = if pkg_manager == PackageManager::Dpkg {
             DpkgIndex::load()
         } else {
             None
         };
-        Self { pkg_manager, dpkg_index, cache: Mutex::new(HashMap::new()) }
+        let meson_index = MesonSubprojectIndex::load(project_dir);
+        Self { pkg_manager, dpkg_index, meson_index, cache: Mutex::new(HashMap::new()) }
     }
 
     pub fn identify(&self, path: &Path) -> ComponentIdentity {
@@ -382,7 +597,12 @@ impl IdentityEngine {
 
     fn identify_local(&self, path: &Path) -> ComponentIdentity {
         let hash = compute_sha256(path).unwrap_or_else(|| "sha256:error".to_string());
-        ComponentIdentity::LocalFile { hash }
+        let (name_hint, version_hint, vcs_url) = self
+            .meson_index
+            .lookup_with_fallback(path)
+            .map(|(n, v, u)| (Some(n), v, u))
+            .unwrap_or((None, None, None));
+        ComponentIdentity::LocalFile { hash, name_hint, version_hint, vcs_url }
     }
 }
 
