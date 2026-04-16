@@ -220,7 +220,12 @@ Key state in the event loop:
 
 ## Ecosystem lock-file scanning
 
-`ecosystem::detect()` runs four parsers concurrently (Cargo / npm / Python / Go).
-Each parser walks upward from `project_dir` to find its lock file.
-Results are deduplicated; `dev`-only dependencies are flagged and omitted unless
-`--ecosystem-dev` is set.
+`ecosystem::detect()` runs four parsers (Cargo / npm / Python / Go).
+Each parser first checks whether its package manager actually ran during the build
+(via `pid_to_comm`): if not, the parser returns immediately without touching the
+filesystem. This ensures that lock files present in the project tree but unrelated
+to the current build are not included in the report.
+
+If the package manager did run, the parser scans `project_dir` for its lock file,
+parses all pinned dependencies, and returns them. Results are deduplicated;
+`dev`-only dependencies are flagged and omitted unless `--ecosystem-dev` is set.

@@ -25,6 +25,10 @@ pub fn detect(
         .values()
         .any(|c| matches!(c.as_str(), "npm" | "node" | "yarn" | "pnpm" | "npx" | "corepack"));
 
+    if !npm_ran {
+        return vec![];
+    }
+
     let mut results = Vec::new();
 
     for lock_path in find_files(project_dir, "package-lock.json", 5) {
@@ -55,10 +59,6 @@ pub fn detect(
             lock_path.display()
         );
         results.extend(components);
-    }
-
-    if !npm_ran && results.is_empty() {
-        return vec![];
     }
 
     results

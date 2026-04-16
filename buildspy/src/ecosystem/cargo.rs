@@ -39,14 +39,12 @@ pub fn detect(
         .values()
         .any(|c| matches!(c.as_str(), "cargo" | "rustc" | "rustdoc" | "clippy-driver"));
 
-    let lock_files = find_files(project_dir, "Cargo.lock", 5);
-
-    if !cargo_ran && lock_files.is_empty() {
+    if !cargo_ran {
         return vec![];
     }
 
     let mut results = Vec::new();
-    for lock_path in lock_files {
+    for lock_path in find_files(project_dir, "Cargo.lock", 5) {
         let Ok(content) = std::fs::read_to_string(&lock_path) else { continue };
         match parse_cargo_lock(&content) {
             Ok(components) => {

@@ -20,14 +20,13 @@ pub fn detect(
     pid_to_comm: &HashMap<u32, String>,
 ) -> Vec<EcosystemComponent> {
     let go_ran = pid_to_comm.values().any(|c| c == "go");
-    let lock_files = find_files(project_dir, "go.sum", 5);
 
-    if !go_ran && lock_files.is_empty() {
+    if !go_ran {
         return vec![];
     }
 
     let mut results = Vec::new();
-    for path in lock_files {
+    for path in find_files(project_dir, "go.sum", 5) {
         let Ok(content) = std::fs::read_to_string(&path) else { continue };
         let components = parse_go_sum(&content);
         log::debug!(

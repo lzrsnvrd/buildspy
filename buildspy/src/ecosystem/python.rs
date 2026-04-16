@@ -27,6 +27,10 @@ pub fn detect(
         c.starts_with("pip") || c.starts_with("python") || matches!(c.as_str(), "uv" | "hatch" | "pdm")
     });
 
+    if !pip_ran {
+        return vec![];
+    }
+
     let mut results = Vec::new();
 
     for path in find_files(project_dir, "Pipfile.lock", 5) {
@@ -58,10 +62,6 @@ pub fn detect(
             log::debug!("ecosystem/python: {} packages from {}", c.len(), path.display());
             results.extend(c);
         }
-    }
-
-    if !pip_ran && results.is_empty() {
-        return vec![];
     }
 
     results
