@@ -67,6 +67,7 @@ pub fn collect_components(
     pid_to_cwd: &HashMap<u32, PathBuf>,
     project_dir: &Path,
     engine: &IdentityEngine,
+    include_orchestrators: bool,
 ) -> HashMap<String, Component> {
     use super::{filter, resolver};
 
@@ -74,7 +75,7 @@ pub fn collect_components(
     let mut unique_paths: HashSet<String> = HashSet::new();
     while let Ok((raw, opener_pid)) = path_rx.try_recv() {
         let opener_comm = pid_to_comm.get(&opener_pid).map(String::as_str).unwrap_or("");
-        if filter::is_build_orchestrator(opener_comm) {
+        if !include_orchestrators && filter::is_build_orchestrator(opener_comm) {
             log::debug!("skip ({}): {}", opener_comm, raw);
             continue;
         }

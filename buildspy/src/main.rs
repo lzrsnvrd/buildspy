@@ -54,6 +54,12 @@ struct Cli {
     #[arg(long)]
     ecosystem_dev: bool,
 
+    /// Include file opens from build orchestrators (cmake, make, ninja, …).
+    /// By default these are filtered out because they are not project dependencies.
+    /// Use this flag to compare against tools that include toolchain/orchestrator files.
+    #[arg(long)]
+    include_orchestrators: bool,
+
     /// Tracing backend to use.
     /// "ebpf"  – eBPF ring-buffer (requires Linux ≥ 4.4 + CAP_BPF).
     /// "ptrace" – ptrace syscall interception (any kernel, CAP_SYS_PTRACE).
@@ -148,6 +154,7 @@ async fn main() -> Result<()> {
         &pid_to_cwd,
         &project_dir,
         &engine,
+        cli.include_orchestrators,
     );
 
     let eco_components = ecosystem::detect(&project_dir, &pid_to_comm, cli.ecosystem_dev);
