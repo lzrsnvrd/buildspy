@@ -597,13 +597,59 @@ impl IdentityEngine {
 
     fn identify_local(&self, path: &Path) -> ComponentIdentity {
         let hash = compute_sha256(path).unwrap_or_else(|| "sha256:error".to_string());
-        let (name_hint, version_hint, vcs_url) = self
-            .meson_index
-            .lookup_with_fallback(path)
-            .map(|(n, v, u)| (Some(n), v, u))
-            .unwrap_or((None, None, None));
+        let (name_hint, version_hint, vcs_url) = if let Some(result) = self.meson_index.lookup_with_fallback(path) {
+            let (n, v, u) = result;
+            (Some(n), v, u)
+        } else {
+            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if filename.contains(".so") {
+                let (name, version) = soname_name_version(path);
+                (name, version, None)
+            } else {
+                (None, None, None)
+            }
+        };
         ComponentIdentity::LocalFile { hash, name_hint, version_hint, vcs_url }
     }
+}
+
+// ---------------------------------------------------------------------------
+// .so filename parser
+// ---------------------------------------------------------------------------
+
+/// Extract library name and full version from a shared-library path.
+///
+/// Resolves symlinks before parsing so that `libmsquic.so.2` (a symlink to
+/// `libmsquic.so.2.4.1`) yields version `"2.4.1"` rather than just `"2"`.
+///
+/// `libssl.so.3.0.0`  → (`Some("ssl")`,    `Some("3.0.0")`)
+/// `libfoo-bar.so`    → (`Some("foo-bar")`, `None`)
+fn soname_name_version(path: &Path) -> (Option<String>, Option<String>) {
+    // Resolve symlink to get the real filename (best-effort).
+    let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let filename = real
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    let Some(so_pos) = filename.find(".so") else {
+        return (None, None);
+    };
+
+    let base = &filename[..so_pos]; // e.g. "libssl", "libfoo-bar"
+    let name = base.strip_prefix("lib").unwrap_or(base);
+    if name.is_empty() {
+        return (None, None);
+    }
+
+    // Version is the suffix after ".so." if it starts with a digit.
+    let after_so = &filename[so_pos + 3..]; // everything after ".so"
+    let version = after_so
+        .strip_prefix('.')
+        .filter(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+        .map(str::to_string);
+
+    (Some(name.to_string()), version)
 }
 
 // ---------------------------------------------------------------------------
