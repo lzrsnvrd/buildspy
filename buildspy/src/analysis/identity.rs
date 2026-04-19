@@ -261,7 +261,7 @@ impl MesonSubprojectIndex {
             // wrap-redirect: filename is relative to the project root.
             // Follow it once (redirects never chain per the Meson spec).
             if let Some(ref target) = parsed.redirect.clone() {
-                let target_path = project_dir.join(target);
+                let target_path = path.parent().unwrap_or(&wrap_dir).join(target);
                 if let Ok(redirected) = fs::read_to_string(&target_path) {
                     parsed = parse_wrap_file(&redirected);
                 } else {
