@@ -256,8 +256,19 @@ impl MesonSubprojectIndex {
                 None => continue,
             };
             let Ok(content) = fs::read_to_string(&path) else { continue };
+            let mut parsed = parse_wrap_file(&content);
 
-            let parsed = parse_wrap_file(&content);
+            // wrap-redirect: filename is relative to the project root.
+            // Follow it once (redirects never chain per the Meson spec).
+            if let Some(ref target) = parsed.redirect.clone() {
+                let target_path = project_dir.join(target);
+                if let Ok(redirected) = fs::read_to_string(&target_path) {
+                    parsed = parse_wrap_file(&redirected);
+                } else {
+                    log::warn!("meson wrap-redirect: cannot read {}", target_path.display());
+                    continue;
+                }
+            }
             // The directory the subproject unpacks into; fall back to wrap name.
             let dirname = parsed.directory
                 .as_deref()
@@ -350,25 +361,38 @@ struct ParsedWrap {
     source_url: Option<String>,
     /// archive filename (wrap-file), e.g. "zlib-1.2.13.tar.gz"
     source_filename: Option<String>,
+    /// path to the real wrap file (wrap-redirect), relative to project root
+    redirect: Option<String>,
 }
 
 fn parse_wrap_file(content: &str) -> ParsedWrap {
     let mut out = ParsedWrap::default();
+    let mut in_redirect = false;
     for line in content.lines() {
         let line = line.trim();
-        if line.starts_with('[') || line.starts_with('#') || line.is_empty() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_redirect = line == "[wrap-redirect]";
             continue;
         }
         if let Some((key, val)) = line.split_once('=') {
             let key = key.trim();
             let val = val.trim();
-            match key {
-                "directory"       => out.directory        = Some(val.to_string()),
-                "url"             => out.url              = Some(val.to_string()),
-                "revision"        => out.revision         = Some(val.to_string()),
-                "source_url"      => out.source_url       = Some(val.to_string()),
-                "source_filename" => out.source_filename  = Some(val.to_string()),
-                _ => {}
+            if in_redirect {
+                if key == "filename" {
+                    out.redirect = Some(val.to_string());
+                }
+            } else {
+                match key {
+                    "directory"       => out.directory        = Some(val.to_string()),
+                    "url"             => out.url              = Some(val.to_string()),
+                    "revision"        => out.revision         = Some(val.to_string()),
+                    "source_url"      => out.source_url       = Some(val.to_string()),
+                    "source_filename" => out.source_filename  = Some(val.to_string()),
+                    _ => {}
+                }
             }
         }
     }
