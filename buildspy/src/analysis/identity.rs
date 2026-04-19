@@ -264,11 +264,21 @@ impl MesonSubprojectIndex {
                 .unwrap_or(&wrap_name)
                 .to_string();
 
-            // Version: prefer revision tag, then directory-name heuristic.
+            // Version priority:
+            //   wrap-git with tag:  revision (e.g. "v3.4.0") → strip leading 'v'
+            //   wrap-file:          source_filename stem (e.g. "zlib-1.2.13.tar.gz")
+            //   directory heuristic: dirname suffix (e.g. "zlib-1.2.13")
+            //   wrap-git with HEAD: read actual commit hash from cloned .git/HEAD
             let version = parsed.revision
                 .as_deref()
                 .and_then(version_from_revision)
-                .or_else(|| version_from_dirname(&dirname));
+                .or_else(|| {
+                    parsed.source_filename
+                        .as_deref()
+                        .and_then(version_from_source_filename)
+                })
+                .or_else(|| version_from_dirname(&dirname))
+                .or_else(|| read_git_head_commit(&wrap_dir.join(&dirname)));
 
             let vcs_url = parsed.url.or(parsed.source_url);
 
@@ -338,6 +348,8 @@ struct ParsedWrap {
     revision: Option<String>,
     /// download URL (wrap-file)
     source_url: Option<String>,
+    /// archive filename (wrap-file), e.g. "zlib-1.2.13.tar.gz"
+    source_filename: Option<String>,
 }
 
 fn parse_wrap_file(content: &str) -> ParsedWrap {
@@ -351,10 +363,11 @@ fn parse_wrap_file(content: &str) -> ParsedWrap {
             let key = key.trim();
             let val = val.trim();
             match key {
-                "directory"  => out.directory   = Some(val.to_string()),
-                "url"        => out.url          = Some(val.to_string()),
-                "revision"   => out.revision     = Some(val.to_string()),
-                "source_url" => out.source_url   = Some(val.to_string()),
+                "directory"       => out.directory        = Some(val.to_string()),
+                "url"             => out.url              = Some(val.to_string()),
+                "revision"        => out.revision         = Some(val.to_string()),
+                "source_url"      => out.source_url       = Some(val.to_string()),
+                "source_filename" => out.source_filename  = Some(val.to_string()),
                 _ => {}
             }
         }
@@ -371,6 +384,48 @@ fn parse_wrap_file(content: &str) -> ParsedWrap {
 fn version_from_revision(revision: &str) -> Option<String> {
     let v = revision.trim_start_matches('v');
     if looks_like_version(v) { Some(v.to_string()) } else { None }
+}
+
+/// Read the checked-out commit hash from a subproject's `.git/HEAD`.
+///
+/// Handles both detached HEAD (bare hash) and symbolic refs (`ref: refs/heads/main`).
+/// Returns the first 12 hex characters, which is enough to identify a commit.
+/// Returns `None` if the directory is not a git repo or the file is unreadable.
+fn read_git_head_commit(subproject_dir: &Path) -> Option<String> {
+    let content = fs::read_to_string(subproject_dir.join(".git/HEAD")).ok()?;
+    let content = content.trim();
+    // Detached HEAD: the file contains the hash directly.
+    if is_hex_hash(content) {
+        return Some(content[..12].to_string());
+    }
+    // Symbolic ref: "ref: refs/heads/main" → read the ref file.
+    if let Some(refname) = content.strip_prefix("ref: ") {
+        let hash = fs::read_to_string(
+            subproject_dir.join(".git").join(refname.trim()),
+        ).ok()?;
+        let hash = hash.trim();
+        if is_hex_hash(hash) {
+            return Some(hash[..12].to_string());
+        }
+    }
+    None
+}
+
+fn is_hex_hash(s: &str) -> bool {
+    s.len() >= 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Extract version from an archive filename like `"zlib-1.2.13.tar.gz"`.
+/// Strips known archive suffixes, then delegates to `version_from_dirname`.
+fn version_from_source_filename(filename: &str) -> Option<String> {
+    let stem = filename
+        .strip_suffix(".tar.gz")
+        .or_else(|| filename.strip_suffix(".tar.xz"))
+        .or_else(|| filename.strip_suffix(".tar.bz2"))
+        .or_else(|| filename.strip_suffix(".tar.zst"))
+        .or_else(|| filename.strip_suffix(".zip"))
+        .unwrap_or(filename);
+    version_from_dirname(stem)
 }
 
 /// Extract version from a directory name like `"zlib-1.3.1"` → `"1.3.1"`.
@@ -436,6 +491,11 @@ impl IdentityEngine {
         };
         let meson_index = MesonSubprojectIndex::load(project_dir);
         Self { pkg_manager, dpkg_index, meson_index, cache: Mutex::new(HashMap::new()) }
+    }
+
+    /// Returns `true` if `path` lives inside a known Meson subproject directory.
+    pub fn is_in_meson_subproject(&self, path: &Path) -> bool {
+        self.meson_index.lookup_with_fallback(path).is_some()
     }
 
     pub fn identify(&self, path: &Path) -> ComponentIdentity {

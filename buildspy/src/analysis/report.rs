@@ -102,14 +102,22 @@ pub fn collect_components(
         if !resolver::is_system_path(path) {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if matches!(ext, "h" | "hpp" | "hxx" | "hh" | "H" | "inl" | "tcc") {
-                continue;
+                // Keep headers from Meson subprojects; drop all other local headers.
+                if !engine.is_in_meson_subproject(path) {
+                    continue;
+                }
             }
         }
 
         let comp = resolve_component(path_str, path, engine);
+        // Meson subproject headers: all files from the same subproject deduplicate
+        // to a single component keyed by the subproject name.
         let key = match comp.component_type {
             ComponentType::SystemPackage => comp.name.clone(),
             ComponentType::SystemUnknown => soname_base(&comp.name),
+            ComponentType::LocalFile if engine.is_in_meson_subproject(path) => {
+                format!("meson:{}", comp.name)
+            }
             _ => path_str.to_string(),
         };
         components.entry(key).or_insert(comp);
