@@ -95,8 +95,13 @@ pub fn collect_components(
 
     // Phase 2: resolve identities and deduplicate.
     let mut components: HashMap<String, Component> = HashMap::new();
-    for path_str in &unique_paths {
-        let path = Path::new(path_str);
+    for opened in &unique_paths {
+        let target = resolver::library_symlink_target(Path::new(opened));
+        if let Some(t) = &target {
+            log::debug!("library symlink: {} → {}", opened, t.display());
+        }
+        let path = target.as_deref().unwrap_or(Path::new(opened));
+        let path_str: &str = &path.to_string_lossy();
 
         if !path.exists() {
             continue;

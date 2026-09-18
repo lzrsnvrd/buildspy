@@ -91,6 +91,27 @@ pub fn normalize(raw: &str, working_dir: &Path) -> PathBuf {
     parts.iter().collect()
 }
 
+/// If `path` is a symlink to a shared library, return the file it points to.
+///
+/// The linker resolves `-lfoo` through the unversioned `libfoo.so` symlink,
+/// which the `-dev` package ships, but what it actually reads — and what the
+/// loader maps at run time — is the target owned by the runtime package
+/// (`libstdc++.so` → `libstdc++.so.6.0.33` from `libstdc++6`).  The `-dev`
+/// package still shows up through the headers it contributes.
+///
+/// Linker scripts (`libc.so`, `libgcc_s.so`) are regular files and are left
+/// alone: the linker opens the libraries they name by itself.
+pub fn library_symlink_target(path: &Path) -> Option<PathBuf> {
+    let filename = path.file_name()?.to_str()?;
+    if !filename.contains(".so") {
+        return None;
+    }
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    std::fs::canonicalize(path).ok()
+}
+
 /// Returns `true` if the path lives under a system prefix.
 pub fn is_system_path(path: &Path) -> bool {
     let s = path.to_string_lossy();

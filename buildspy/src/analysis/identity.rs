@@ -197,7 +197,32 @@ impl DpkgIndex {
             }
         }
 
+        Self::add_merged_usr_aliases(&mut map);
         Ok(map)
+    }
+
+    /// On merged-usr systems (`/lib` → `usr/lib`, …) a few packages still list
+    /// their files under the legacy top-level directories.  Index those under
+    /// the `/usr` spelling too, so that canonical paths — which always come out
+    /// as `/usr/…` — resolve (e.g. `libfuse3.so` → `libfuse3.so.3.14.0`, which
+    /// `libfuse3-3` lists as `/lib/x86_64-linux-gnu/libfuse3.so.3.14.0`).
+    fn add_merged_usr_aliases(map: &mut HashMap<String, String>) {
+        let merged: Vec<&str> = ["/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"]
+            .into_iter()
+            .filter(|dir| fs::canonicalize(dir).is_ok_and(|c| c == Path::new("/usr").join(&dir[1..])))
+            .collect();
+        let aliases: Vec<(String, String)> = map
+            .iter()
+            .filter(|(path, _)| {
+                merged
+                    .iter()
+                    .any(|dir| path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/')))
+            })
+            .map(|(path, pkg)| (format!("/usr{path}"), pkg.clone()))
+            .collect();
+        for (alias, pkg) in aliases {
+            map.entry(alias).or_insert(pkg);
+        }
     }
 
     fn lookup(&self, path: &str) -> Option<(String, String, Option<String>, Option<String>)> {
