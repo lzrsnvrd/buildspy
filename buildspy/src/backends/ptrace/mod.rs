@@ -1,6 +1,7 @@
 //! ptrace tracing backend.
 //!
-//! Intercepts `openat(2)` calls and follows the complete process tree via
+//! Intercepts the open syscalls (`open`, `openat`, `openat2`; x86_64 and
+//! i386 ABIs — see [`syscalls`]) and follows the complete process tree via
 //! `PTRACE_O_TRACEFORK`, `PTRACE_O_TRACECLONE`, and `PTRACE_O_TRACEVFORK`.
 //!
 //! # Trace mode selection
@@ -8,12 +9,20 @@
 //! On startup the backend tries to install a seccomp-bpf filter (see
 //! [`seccomp`]) in the child process.  If the kernel supports it (Linux ≥
 //! 3.5) the event loop uses **`PTRACE_CONT`** and receives a single
-//! `PTRACE_EVENT_SECCOMP` stop only for `openat` calls, reducing overhead by
+//! `PTRACE_EVENT_SECCOMP` stop only for open calls, reducing overhead by
 //! roughly two orders of magnitude.  On older kernels the backend falls back
 //! to **`PTRACE_SYSCALL`** which stops on every syscall entry and exit.
 //!
 //! The trace mode is communicated from the child process to the tracer thread
 //! via a one-byte pipe written in `pre_exec` (after fork, before exec).
+//!
+//! # Processes that outlive the build
+//!
+//! When the root process exits, tracing continues for [`ORPHAN_GRACE`] so
+//! background jobs it left behind can finish and have their opens recorded.
+//! In Seccomp mode whatever is still alive then is killed (`PTRACE_O_EXITKILL`
+//! fires when the ptrace thread exits): the filter cannot be removed, and an
+//! untraced process would fail every open with `ENOSYS`.
 //!
 //! # Architecture note
 //!
@@ -29,6 +38,7 @@
 mod diagnostics;
 mod mem;
 mod seccomp;
+mod syscalls;
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("the ptrace backend currently only supports x86_64");
@@ -40,6 +50,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicI32, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -47,32 +58,41 @@ use nix::{
     sys::{
         ptrace,
         ptrace::Options,
-        signal::{killpg, sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal},
+        signal::{
+            killpg, sigaction, SaFlags, SigAction, SigEvent, SigHandler, SigSet, SigevNotify,
+            Signal,
+        },
+        time::TimeSpec,
+        timer::{Expiration, Timer, TimerSetTimeFlags},
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
+    time::ClockId,
     unistd::{gettid, Pid},
 };
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::TracingSession;
+use syscalls::PathArg;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// `openat(2)` syscall number on x86_64.
-const OPENAT_NR: u64 = 257;
 
 /// `PTRACE_EVENT_SECCOMP` — delivered when a seccomp filter returns
 /// `SECCOMP_RET_TRACE`.  The value is not (yet) exposed by the nix crate as
 /// a named constant, so we define it here.
 const PTRACE_EVENT_SECCOMP: i32 = 7;
 
+/// How long to keep tracing after the root build process exits, so that
+/// background jobs it left behind can finish.  Survivors are then killed
+/// (Seccomp mode) or detached (FullSyscall mode).
+const ORPHAN_GRACE: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // Trace mode
 // ---------------------------------------------------------------------------
 
-/// How the ptrace event loop intercepts `openat` calls.
+/// How the ptrace event loop intercepts open calls.
 ///
 /// Chosen once at startup based on whether the seccomp-bpf filter was
 /// successfully installed in the child process.
@@ -80,8 +100,8 @@ const PTRACE_EVENT_SECCOMP: i32 = 7;
 enum TraceMode {
     /// seccomp-bpf filter active.
     ///
-    /// Processes are resumed with `PTRACE_CONT`.  The only syscall that
-    /// generates a ptrace stop is `openat(2)`, delivered as
+    /// Processes are resumed with `PTRACE_CONT`.  The only syscalls that
+    /// generate a ptrace stop are the open calls, delivered as
     /// `PTRACE_EVENT_SECCOMP`.  No entry/exit pair tracking required.
     Seccomp,
 
@@ -107,7 +127,12 @@ extern "C" fn sigusr1_noop(_: c_int) {}
 // ---------------------------------------------------------------------------
 
 /// Spawn the build command under ptrace and return a `TracingSession`.
-pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession> {
+pub fn start(
+    cmd: &[String],
+    cwd: &Path,
+    verbose: bool,
+    env: &[(String, String)],
+) -> Result<TracingSession> {
     let (path_tx, path_rx) = tokio::sync::mpsc::unbounded_channel::<(String, u32)>();
     let (new_pid_tx, new_pid_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<Option<i32>>();
@@ -123,6 +148,7 @@ pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession
 
     let cmd: Vec<String> = cmd.to_vec();
     let cwd: PathBuf = cwd.to_path_buf();
+    let env: Vec<(String, String)> = env.to_vec();
 
     // The ptrace thread forks the child AND runs the event loop — all on the
     // same OS thread, as required by the Linux ptrace API.
@@ -164,7 +190,10 @@ pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession
             // Spawn the child.
             // ------------------------------------------------------------------
             let mut command = std::process::Command::new(&cmd[0]);
-            command.args(&cmd[1..]).current_dir(&cwd);
+            command
+                .args(&cmd[1..])
+                .current_dir(&cwd)
+                .envs(env.iter().map(|(k, v)| (k, v)));
 
             // pre_exec runs after fork, before exec, in the child process.
             // Only async-signal-safe operations are allowed here.
@@ -225,7 +254,7 @@ pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession
             unsafe { libc::close(seccomp_read_fd) };
 
             let mode = if n == 1 && status_byte[0] == 1 {
-                log::info!("ptrace: seccomp-bpf filter active — stopping only on openat(2)");
+                log::info!("ptrace: seccomp-bpf filter active — stopping only on open syscalls");
                 TraceMode::Seccomp
             } else {
                 log::warn!(
@@ -307,6 +336,65 @@ fn resume(pid: Pid, sig: Option<Signal>, mode: TraceMode) {
 }
 
 // ---------------------------------------------------------------------------
+// Orphan grace period
+// ---------------------------------------------------------------------------
+
+/// Arm a timer that interrupts this thread's `waitpid` (SIGUSR1 → EINTR) once
+/// [`ORPHAN_GRACE`] has elapsed, then every 250 ms in case a tick lands while
+/// the thread is not blocked.  The timer is deleted on drop.  If it cannot be
+/// created, the watchdog's 10 s ping is the (slower) fallback.
+fn arm_orphan_timer() -> Option<Timer> {
+    let event = SigEvent::new(SigevNotify::SigevThreadId {
+        signal: Signal::SIGUSR1,
+        thread_id: gettid().as_raw(),
+        si_value: 0,
+    });
+    let armed = Timer::new(ClockId::CLOCK_MONOTONIC, event).and_then(|mut timer| {
+        timer.set(
+            Expiration::IntervalDelayed(
+                TimeSpec::from_duration(ORPHAN_GRACE),
+                TimeSpec::from_duration(Duration::from_millis(250)),
+            ),
+            TimerSetTimeFlags::empty(),
+        )?;
+        Ok(timer)
+    });
+    match armed {
+        Ok(timer) => Some(timer),
+        Err(e) => {
+            log::debug!("ptrace: orphan grace timer unavailable ({e}); relying on the watchdog");
+            None
+        }
+    }
+}
+
+/// Report the processes still alive when [`ORPHAN_GRACE`] expires.  Only
+/// thread-group leaders are listed; their threads share their fate.
+fn log_orphans(alive_pids: &std::collections::HashSet<u32>, exit_kills: bool) {
+    let mut procs: Vec<String> = alive_pids
+        .iter()
+        .filter(|&&pid| mem::read_tgid(pid) == Some(pid))
+        .map(|&pid| format!("{} ({pid})", crate::proc_info::read_comm(pid)))
+        .collect();
+    if procs.is_empty() {
+        return;
+    }
+    procs.sort();
+    let action = if exit_kills {
+        "killing them: the seccomp filter cannot be removed, and untraced they would \
+         fail every open with ENOSYS"
+    } else {
+        "detaching them; their further opens are not recorded"
+    };
+    log::warn!(
+        "ptrace: {} process(es) still running {}s after the build exited: {}; {action}.",
+        procs.len(),
+        ORPHAN_GRACE.as_secs(),
+        procs.join(", ")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // ptrace event loop
 // ---------------------------------------------------------------------------
 
@@ -343,6 +431,11 @@ fn ptrace_loop(
     //
     // FullSyscall mode: PTRACE_O_TRACESYSGOOD sets bit 7 of the signal in
     //   PtraceSyscall events so they are distinguishable from real SIGTRAPs.
+    //
+    // PTRACE_O_EXITKILL (Seccomp mode only) SIGKILLs every tracee when this
+    // thread exits — after ORPHAN_GRACE, or if buildspy dies.  Detaching
+    // instead would leave them behind with a filter that fails every open
+    // with ENOSYS.  It needs Linux ≥ 3.8, so retry without it on EINVAL.
     let base_options = Options::PTRACE_O_TRACEFORK
         | Options::PTRACE_O_TRACECLONE
         | Options::PTRACE_O_TRACEVFORK
@@ -353,7 +446,27 @@ fn ptrace_loop(
         TraceMode::FullSyscall => base_options | Options::PTRACE_O_TRACESYSGOOD,
     };
 
-    if let Err(e) = ptrace::setoptions(root, options) {
+    let mut exit_kills = false;
+    let set = match mode {
+        TraceMode::Seccomp => {
+            match ptrace::setoptions(root, options | Options::PTRACE_O_EXITKILL) {
+                Ok(()) => {
+                    exit_kills = true;
+                    Ok(())
+                }
+                Err(nix::errno::Errno::EINVAL) => {
+                    log::warn!(
+                        "ptrace: PTRACE_O_EXITKILL unsupported (kernel < 3.8?) — processes \
+                         that outlive the build will fail every open with ENOSYS"
+                    );
+                    ptrace::setoptions(root, options)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        TraceMode::FullSyscall => ptrace::setoptions(root, options),
+    };
+    if let Err(e) = set {
         log::error!("ptrace: setoptions failed: {e}");
         let _ = exit_tx.send(None);
         return;
@@ -403,10 +516,21 @@ fn ptrace_loop(
     let mut stall_count: u32 = 0;
     let mut exit_code: Option<i32> = None;
 
+    // Set once the root process has exited: tracing continues until every
+    // remaining tracee is gone (ECHILD) or the deadline passes.  The timer
+    // interrupts `waitpid` with SIGUSR1 so the deadline is noticed promptly.
+    let mut orphan_deadline: Option<Instant> = None;
+    let mut _orphan_timer: Option<Timer> = None;
+
     // ------------------------------------------------------------------
     // Main event loop
     // ------------------------------------------------------------------
     loop {
+        if orphan_deadline.is_some_and(|d| Instant::now() >= d) {
+            log_orphans(&alive_pids, exit_kills);
+            break;
+        }
+
         let status = match waitpid(None, Some(WaitPidFlag::__WALL)) {
             Ok(s) => {
                 // Any real event resets the stall counter.
@@ -434,6 +558,12 @@ fn ptrace_loop(
                         }
                     }
                     break;
+                }
+
+                // Grace-period timer (or a watchdog ping during it): the
+                // deadline is checked at the top of the loop.
+                if orphan_deadline.is_some() {
+                    continue;
                 }
 
                 // Watchdog ping — log alive processes and their wait channels.
@@ -523,9 +653,11 @@ fn ptrace_loop(
                 }
                 if pid == root {
                     exit_code = Some(code);
-                    // Root exited — descendants will be detached automatically
-                    // when this thread exits.
-                    break;
+                    orphan_deadline = Some(Instant::now() + ORPHAN_GRACE);
+                    // Usually nothing is left and waitpid returns ECHILD at once.
+                    if !alive_pids.is_empty() {
+                        _orphan_timer = arm_orphan_timer();
+                    }
                 }
             }
 
@@ -563,7 +695,10 @@ fn ptrace_loop(
                 }
                 if pid == root {
                     exit_code = None;
-                    break;
+                    orphan_deadline = Some(Instant::now() + ORPHAN_GRACE);
+                    if !alive_pids.is_empty() {
+                        _orphan_timer = arm_orphan_timer();
+                    }
                 }
             }
 
@@ -596,8 +731,8 @@ fn ptrace_loop(
                                 regs.orig_rax
                             );
                         }
-                        if regs.orig_rax == OPENAT_NR {
-                            mem::emit_path(&path_tx, pid_u32, regs.rsi);
+                        if let Some(arg) = PathArg::for_syscall(&regs) {
+                            mem::emit_path(&path_tx, pid_u32, arg.pointer(&regs));
                         }
                     } else {
                         log::debug!("ptrace: PtraceSyscall({pid}) ENTRY (getregs failed)");
@@ -660,21 +795,24 @@ fn ptrace_loop(
                         in_syscall.remove(&pid_u32);
                     }
 
-                    // SECCOMP=7 — openat via seccomp filter (Seccomp mode only)
+                    // SECCOMP=7 — an open call caught by the filter (Seccomp
+                    // mode only).  The filter's SECCOMP_RET_DATA says which
+                    // register holds the pathname.
                     e if e == PTRACE_EVENT_SECCOMP => {
-                        log::debug!("ptrace: PtraceEvent({pid}, SECCOMP) → openat");
-                        if let Ok(regs) = ptrace::getregs(pid) {
-                            // Sanity-check: the filter only traces openat, but
-                            // verify so a future filter extension doesn't silently
-                            // misinterpret other syscalls.
-                            if regs.orig_rax == OPENAT_NR {
-                                mem::emit_path(&path_tx, pid_u32, regs.rsi);
-                            } else {
+                        let data = ptrace::getevent(pid).unwrap_or(0);
+                        match (PathArg::from_seccomp_data(data as u64), ptrace::getregs(pid)) {
+                            (Some(arg), Ok(regs)) => {
                                 log::debug!(
-                                    "ptrace: SECCOMP stop for unexpected syscall {} on PID {pid}",
+                                    "ptrace: PtraceEvent({pid}, SECCOMP) → syscall {} ({arg:?})",
                                     regs.orig_rax
                                 );
+                                mem::emit_path(&path_tx, pid_u32, arg.pointer(&regs));
                             }
+                            (arg, regs) => log::debug!(
+                                "ptrace: PtraceEvent({pid}, SECCOMP) — unusable stop \
+                                 (data={data}, arg={arg:?}, getregs ok={})",
+                                regs.is_ok()
+                            ),
                         }
                     }
 

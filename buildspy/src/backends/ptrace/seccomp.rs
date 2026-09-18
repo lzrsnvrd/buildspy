@@ -1,12 +1,20 @@
 //! seccomp-bpf filter for the ptrace backend.
 //!
-//! Installs a minimal classic-BPF (cBPF) filter that routes only `openat(2)`
-//! to the ptrace tracer via `SECCOMP_RET_TRACE`, and passes every other
-//! syscall through with `SECCOMP_RET_ALLOW` — no ptrace stop, no overhead.
+//! Installs a minimal classic-BPF (cBPF) filter that routes only the open
+//! syscalls listed in [`super::syscalls`] to the ptrace tracer via
+//! `SECCOMP_RET_TRACE`, and passes every other syscall through with
+//! `SECCOMP_RET_ALLOW` — no ptrace stop, no overhead.
 //!
 //! This reduces the number of ptrace events from O(all syscalls) down to
-//! O(openat calls only), cutting tracing overhead by two orders of magnitude
+//! O(open calls only), cutting tracing overhead by two orders of magnitude
 //! compared to plain `PTRACE_SYSCALL`.
+//!
+//! # Tracer lifetime
+//!
+//! A filter can never be removed, and `SECCOMP_RET_TRACE` with no tracer
+//! attached fails the syscall with `ENOSYS`.  A process that outlives the
+//! tracer would therefore fail every open from then on — the event loop must
+//! never leave a tracee running untraced (see `ORPHAN_GRACE` in `mod.rs`).
 //!
 //! # Kernel compatibility
 //!
@@ -21,6 +29,11 @@
 //! never panics.
 
 use libc::{sock_filter, sock_fprog};
+
+use super::syscalls::{
+    PathArg, AUDIT_ARCH_I386, AUDIT_ARCH_X86_64, I386_OPEN, I386_OPENAT, I386_OPENAT2,
+    X86_64_OPEN, X86_64_OPENAT, X86_64_OPENAT2,
+};
 
 // ---------------------------------------------------------------------------
 // Classic-BPF instruction encoding
@@ -48,25 +61,14 @@ const OFF_NR: u32 = 0;
 const OFF_ARCH: u32 = 4;
 
 // ---------------------------------------------------------------------------
-// Architecture and syscall constants (x86_64 only)
-// ---------------------------------------------------------------------------
-
-/// `EM_X86_64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE`
-const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
-
-/// `openat(2)` syscall number on x86_64.
-const SYS_OPENAT: u32 = 257;
-
-// ---------------------------------------------------------------------------
 // seccomp return actions
 // ---------------------------------------------------------------------------
 
 /// Allow the syscall — no ptrace stop, no overhead.
 const RET_ALLOW: u32 = 0x7fff_0000;
-/// Deliver a `PTRACE_EVENT_SECCOMP` stop to the tracer.
+/// Deliver a `PTRACE_EVENT_SECCOMP` stop to the tracer.  The low 16 bits
+/// (`SECCOMP_RET_DATA`) reach the tracer via `PTRACE_GETEVENTMSG`.
 const RET_TRACE: u32 = 0x7ff0_0000;
-/// Kill the offending thread (used for the unexpected-arch safety check).
-const RET_KILL: u32 = 0x0000_0000;
 
 // ---------------------------------------------------------------------------
 // BPF instruction helpers
@@ -82,35 +84,74 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) -> sock_filter {
     sock_filter { code, jt, jf, k }
 }
 
+/// `if acc == k` falls through to the next instruction, else skips `jf`.
+#[inline]
+fn jeq(k: u32, jf: u8) -> sock_filter {
+    jump(BPF_JMP | BPF_JEQ | BPF_K, k, 0, jf)
+}
+
+/// Trace the syscall, telling the tracer where its pathname is.
+#[inline]
+fn ret_trace(arg: PathArg) -> sock_filter {
+    stmt(BPF_RET | BPF_K, RET_TRACE | arg as u32)
+}
+
 // ---------------------------------------------------------------------------
 // Filter program
 // ---------------------------------------------------------------------------
 
 /// Build the seccomp BPF program.
 ///
-/// The generated program has this logic:
+/// The generated program has this logic (jumps are relative: a skip of `n`
+/// lands `n + 1` instructions ahead):
 ///
 /// ```text
-/// [0] LD   arch
-/// [1] JEQ  AUDIT_ARCH_X86_64  → true: goto [3]; false: fall through to [2]
-/// [2] RET  KILL                (unexpected architecture — should never happen)
-/// [3] LD   nr
-/// [4] JEQ  SYS_OPENAT          → true: goto [6]; false: fall through to [5]
-/// [5] RET  ALLOW
-/// [6] RET  TRACE
+///  [0] LD   arch
+///  [1] JEQ  AUDIT_ARCH_X86_64   → true: [2]; false: [10]
+///  [2] LD   nr
+///  [3] JEQ  openat  (257)       → true: [4]; false: [5]
+///  [4] RET  TRACE | Rsi
+///  [5] JEQ  openat2 (437)       → true: [6]; false: [7]
+///  [6] RET  TRACE | Rsi
+///  [7] JEQ  open    (2)         → true: [8]; false: [9]
+///  [8] RET  TRACE | Rdi
+///  [9] RET  ALLOW
+/// [10] JEQ  AUDIT_ARCH_I386     → true: [11]; false: [18]  (acc still = arch)
+/// [11] LD   nr
+/// [12] JEQ  openat  (295)       → true: [13]; false: [14]
+/// [13] RET  TRACE | Ecx
+/// [14] JEQ  openat2 (437)       → true: [15]; false: [16]
+/// [15] RET  TRACE | Ecx
+/// [16] JEQ  open    (5)         → true: [17]; false: [18]
+/// [17] RET  TRACE | Ebx
+/// [18] RET  ALLOW                (any other arch: never kill the build)
 /// ```
-fn build_filter() -> [sock_filter; 7] {
+fn build_filter() -> [sock_filter; 19] {
     [
-        // Check architecture.
-        stmt(BPF_LD  | BPF_W | BPF_ABS,  OFF_ARCH),
-        jump(BPF_JMP | BPF_JEQ | BPF_K,  AUDIT_ARCH_X86_64, 1, 0),
-        stmt(BPF_RET | BPF_K,             RET_KILL),
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH),
+        jeq(AUDIT_ARCH_X86_64, 8),
 
-        // Check syscall number.
-        stmt(BPF_LD  | BPF_W | BPF_ABS,  OFF_NR),
-        jump(BPF_JMP | BPF_JEQ | BPF_K,  SYS_OPENAT, 1, 0),
-        stmt(BPF_RET | BPF_K,             RET_ALLOW),
-        stmt(BPF_RET | BPF_K,             RET_TRACE),
+        // x86_64
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
+        jeq(X86_64_OPENAT, 1),
+        ret_trace(PathArg::Rsi),
+        jeq(X86_64_OPENAT2, 1),
+        ret_trace(PathArg::Rsi),
+        jeq(X86_64_OPEN, 1),
+        ret_trace(PathArg::Rdi),
+        stmt(BPF_RET | BPF_K, RET_ALLOW),
+
+        // i386
+        jeq(AUDIT_ARCH_I386, 7),
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
+        jeq(I386_OPENAT, 1),
+        ret_trace(PathArg::Ecx),
+        jeq(I386_OPENAT2, 1),
+        ret_trace(PathArg::Ecx),
+        jeq(I386_OPEN, 1),
+        ret_trace(PathArg::Ebx),
+
+        stmt(BPF_RET | BPF_K, RET_ALLOW),
     ]
 }
 

@@ -40,7 +40,12 @@ static EBPF_BYTECODE: &[u8] =
 
 /// Initialise the eBPF subsystem, spawn the build command, and return a
 /// `TracingSession` that emits events until the build exits.
-pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession> {
+pub fn start(
+    cmd: &[String],
+    cwd: &Path,
+    verbose: bool,
+    env: &[(String, String)],
+) -> Result<TracingSession> {
     let mut bpf = load(verbose)?;
 
     // Extract the ring buffer BEFORE wrapping bpf in Arc so we avoid
@@ -55,6 +60,7 @@ pub fn start(cmd: &[String], cwd: &Path, verbose: bool) -> Result<TracingSession
     let child = tokio::process::Command::new(&cmd[0])
         .args(&cmd[1..])
         .current_dir(cwd)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .spawn()
         .with_context(|| format!("failed to spawn '{}'", cmd[0]))?;
 

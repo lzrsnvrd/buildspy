@@ -7,6 +7,10 @@ edition.workspace = true
 name = "buildspy"
 path = "src/main.rs"
 
+[[bin]]
+name = "callgraph-spike"
+path = "src/bin/callgraph_spike.rs"
+
 [dependencies]
 # Aya user-space runtime (async tokio backend).
 aya     = { version = "0.13", features = ["async_tokio"] }
@@ -36,7 +40,7 @@ uuid = { version = "1", features = ["v4"] }
 toml = { version = "0.8" }
 
 # ptrace backend (Linux-only, x86_64).
-nix  = { version = "0.29", features = ["ptrace", "process", "signal"] }
+nix  = { version = "0.29", features = ["ptrace", "process", "signal", "time"] }
 libc = { version = "0.2" }
 
 # Error handling / CLI.
@@ -44,6 +48,12 @@ anyhow    = { version = "1" }
 clap      = { version = "4", features = ["derive"] }
 log       = { version = "0.4" }
 env_logger = { version = "0.11" }
+
+# Reachability analysis (callgraph spike).
+goblin         = { version = "0.8" }
+capstone       = { version = "0.12" }
+cpp_demangle   = { version = "0.4" }
+rustc-demangle = { version = "0.1" }
 
 [build-dependencies]
 # aya-build compiles the eBPF crate with the correct nightly toolchain,

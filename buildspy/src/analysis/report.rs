@@ -8,6 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::identity::{ComponentIdentity, IdentityEngine};
+use crate::reachability::types::ReachabilityResult;
 
 // ---------------------------------------------------------------------------
 // Output schema
@@ -20,6 +21,8 @@ pub struct Report {
     pub project_dir: String,
     pub exit_code: Option<i32>,
     pub components: Vec<Component>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<Vec<ReachabilityResult>>,
 }
 
 /// Variant order matches the desired sort order in the output report.

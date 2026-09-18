@@ -61,24 +61,28 @@ impl Backend {
 // ---------------------------------------------------------------------------
 
 /// Start a tracing session using the requested backend.
+///
+/// `env` is merged into the build's inherited environment (bitcode capture uses
+/// it to substitute `CC`/`CXX` with gllvm's wrappers).
 pub fn start_session(
     backend: Backend,
     cmd: &[String],
     cwd: &Path,
     verbose: bool,
+    env: &[(String, String)],
 ) -> Result<TracingSession> {
     match backend {
-        Backend::Ebpf => ebpf::start(cmd, cwd, verbose),
-        Backend::Ptrace => ptrace::start(cmd, cwd, verbose),
+        Backend::Ebpf => ebpf::start(cmd, cwd, verbose, env),
+        Backend::Ptrace => ptrace::start(cmd, cwd, verbose, env),
         Backend::Auto => {
-            match ebpf::start(cmd, cwd, verbose) {
+            match ebpf::start(cmd, cwd, verbose, env) {
                 Ok(session) => {
                     log::info!("Backend: eBPF.");
                     Ok(session)
                 }
                 Err(e) => {
                     log::warn!("eBPF unavailable ({e}), falling back to ptrace.");
-                    ptrace::start(cmd, cwd, verbose)
+                    ptrace::start(cmd, cwd, verbose, env)
                 }
             }
         }

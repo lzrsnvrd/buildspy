@@ -42,9 +42,19 @@ fn read_path_from_mem(pid: u32, ptr: u64) -> Option<String> {
 /// processed.  At the time of the call the child is a regular zombie so the
 /// file is still readable.
 pub fn read_ppid(pid: u32) -> Option<u32> {
+    read_status_field(pid, "PPid:")
+}
+
+/// Read the thread-group ID (`Tgid:`) from `/proc/{pid}/status`.  Equal to
+/// `pid` for a process's main thread.
+pub fn read_tgid(pid: u32) -> Option<u32> {
+    read_status_field(pid, "Tgid:")
+}
+
+fn read_status_field(pid: u32, field: &str) -> Option<u32> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("PPid:") {
+        if let Some(rest) = line.strip_prefix(field) {
             return rest.trim().parse::<u32>().ok();
         }
     }

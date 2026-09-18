@@ -10,6 +10,7 @@ level and produces a dependency report and a CycloneDX 1.6 SBOM.
 - **System package resolution**: maps file paths to dpkg / pacman / rpm package names and versions using an in-memory index (no subprocess per file).
 - **Ecosystem lock-file scanning**: reads `Cargo.lock`, `package-lock.json`, `yarn.lock`, `poetry.lock`, `requirements.txt`, `go.mod`, `go.sum` concurrently.
 - **Two output formats**: `report.json` (custom schema) and `bom.cdx.json` (CycloneDX 1.6).
+- **Reachability analysis** (optional): given a CVE's vulnerable function, decides whether it is reachable from `main` — with an honest `true` / `false` / `unknown` result. See [docs/reachability.md](docs/reachability.md).
 
 ## Requirements
 
@@ -55,7 +56,11 @@ sudo ./buildspy --ecosystem-dev -- cargo build
 | `--project-dir` / `-p` | current directory | Root for distinguishing local vs. system files |
 | `--backend` | `auto` | `auto` \| `ebpf` \| `ptrace` |
 | `--ecosystem-dev` | off | Include dev/test dependencies from lock files |
+| `--include-orchestrators` | off | Include files opened by build orchestrators (cmake, make, ninja, …), normally filtered out |
 | `--verbose` / `-v` | off | Debug log output |
+
+Reachability analysis adds `--reachability`, `--reachability-binary`, and a few
+refinement flags; see [docs/reachability.md](docs/reachability.md).
 
 ## Output
 
@@ -89,6 +94,54 @@ Two files are written after the build completes.
 | `local_file` | Local build artifact; identified by SHA-256 |
 | `ecosystem_package` | From a lock file (Cargo, npm, pip, Go modules) |
 | `system_unknown` | On a system path but not in the package DB |
+
+## Reachability analysis (optional)
+
+An SBOM tells you a vulnerable library is *present*; it does not tell you whether
+the vulnerable code is ever *callable*. Pass `--reachability` with a list of CVE
+symbols and a build artifact to find out:
+
+```bash
+sudo ./buildspy \
+  --reachability targets.json \
+  --reachability-binary ./build/my_app \
+  -- cmake --build ./build
+```
+
+```json
+// targets.json
+[
+  { "cve": "CVE-2022-37434", "symbol": "inflate", "library": "zlib" }
+]
+```
+
+Each target resolves to an honest `true` / `false` / `null` (undetermined), with
+a concrete call `chain` when reachable, added to `report.json`:
+
+```json
+{
+  "reachability": [
+    {
+      "cve": "CVE-2022-37434",
+      "symbol": "inflate",
+      "reachable": true,
+      "chain": ["main", "read_archive", "zlib_decompress", "inflate"]
+    }
+  ]
+}
+```
+
+The artifact may be an ELF binary or LLVM bitcode (auto-detected), and optional
+flags trade extra tooling for precision — following shared libraries, resolving
+C++ virtual calls, or resolving function pointers with SVF points-to analysis.
+
+The highest-precision backends need whole-program LLVM bitcode, which
+`--reachability-capture-bitcode` produces from your **unmodified build**: buildspy
+substitutes [gllvm](https://github.com/SRI-CSL/gllvm)'s compiler wrappers into the
+traced build's environment and reassembles the bitcode afterwards. No Makefile or
+CMakeLists edits; if anything is missing it warns and falls back to ELF analysis.
+
+See **[docs/reachability.md](docs/reachability.md)** for the full guide.
 
 ## License
 

@@ -4,7 +4,10 @@
 header, and source file opened during a build. It intercepts `openat` syscalls and produces
 `report.json` (custom schema) and `bom.cdx.json` (CycloneDX 1.6 SBOM).
 
-Full documentation: [docs/architecture.md](docs/architecture.md) · [docs/design-decisions.md](docs/design-decisions.md)
+It can also optionally decide whether a CVE's vulnerable function is **reachable**
+from `main` (`--reachability`).
+
+Full documentation: [docs/architecture.md](docs/architecture.md) · [docs/design-decisions.md](docs/design-decisions.md) · [docs/reachability.md](docs/reachability.md)
 
 ---
 
@@ -30,7 +33,8 @@ sudo ./target/debug/buildspy --backend ptrace -- make -j$(nproc)
 cargo test -p buildspy
 ```
 
-Tests live in `buildspy/src/analysis/resolver.rs`.
+Tests live in `buildspy/src/analysis/resolver.rs` and in the reachability
+call-graph parsers (`buildspy/src/reachability/llvm.rs`, `svf.rs`).
 
 ---
 
