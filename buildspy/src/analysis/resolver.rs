@@ -15,17 +15,22 @@ const RELEVANT_EXTENSIONS: &[&str] = &["so", "a", "h", "hpp", "hxx", "c"];
 /// installed and not tracked by dpkg/pacman/rpm.
 pub const SYSTEM_PREFIXES: &[&str] = &["/usr/lib", "/usr/include", "/lib/", "/lib64/"];
 
-/// Path prefixes we always ignore (kernel virtual fs, pipe artefacts, …).
-const NOISE_PREFIXES: &[&str] = &[
+/// Kernel virtual filesystems and fd pseudo-paths — never files a build
+/// produces or consumes.
+const VIRTUAL_PREFIXES: &[&str] = &[
     "/proc/",
     "/sys/",
     "/dev/",
     "/run/",
-    "/tmp/",
     "pipe:",
     "socket:",
     "anon_inode:",
 ];
+
+/// Returns `true` for kernel virtual-fs paths and fd pseudo-paths.
+pub fn is_virtual(raw: &str) -> bool {
+    VIRTUAL_PREFIXES.iter().any(|prefix| raw.starts_with(prefix))
+}
 
 /// Returns `true` if the path is worth recording.
 pub fn is_relevant(raw: &str) -> bool {
@@ -33,11 +38,9 @@ pub fn is_relevant(raw: &str) -> bool {
         return false;
     }
 
-    // Drop kernel virtual-fs paths and other noise.
-    for prefix in NOISE_PREFIXES {
-        if raw.starts_with(prefix) {
-            return false;
-        }
+    // Drop kernel virtual-fs paths and compiler temporaries.
+    if is_virtual(raw) || raw.starts_with("/tmp/") {
+        return false;
     }
 
     // Keep only files with relevant extensions.

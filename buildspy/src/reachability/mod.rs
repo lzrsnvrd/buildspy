@@ -9,7 +9,7 @@
 //!     `known_symbols`. [`classify`] then answers `reachable` / `not_reachable`
 //!     with no library loading at all. This is the default and needs no flag.
 //!   * **Level 2 — partial intra-`.so` graph (opt-in via `follow_shared`).**
-//!     Pull in the transitive `DT_NEEDED` closure ([`deps::collect_so_closure`])
+//!     Pull in the transitive `DT_NEEDED` closure ([`crate::analysis::deps::collect_so_closure`])
 //!     and run each `.so` through [`ElfExtractor`], merging the exported→exported
 //!     and exported→import edges. This makes multi-hop chains across the public
 //!     API contour (e.g. `curl_easy_perform → SSL_connect`) visible. Gaps become
@@ -25,7 +25,6 @@ pub mod types;
 
 mod callgraph;
 mod demangle;
-mod deps;
 mod elf;
 mod extractor;
 mod llvm;
@@ -246,7 +245,7 @@ impl ReachabilityAnalyzer {
         let mut merged = 0usize;
 
         for &artifact in artifacts {
-            for so in deps::collect_so_closure(artifact) {
+            for so in crate::analysis::deps::collect_so_closure(artifact) {
                 if !analyzed.insert(so.clone()) {
                     continue;
                 }
