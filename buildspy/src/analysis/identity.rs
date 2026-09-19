@@ -101,17 +101,20 @@ fn detect_package_manager() -> PackageManager {
 /// `/var/lib/dpkg/status`.  Replaces subprocess calls to `dpkg -S` /
 /// `dpkg-query -W` with O(1) HashMap lookups.
 struct DpkgIndex {
-    /// Absolute file path → "pkgname:arch" key.
+    /// Absolute file path → package key: the stem of dpkg's `info/<key>.list`,
+    /// `name:arch` for `Multi-Arch: same` packages and a bare `name` otherwise.
     path_to_pkg: HashMap<String, String>,
-    /// "pkgname:arch" → version string.
+    /// Package key → version string.
     pkg_to_version: HashMap<String, String>,
-    /// "pkgname:arch" → upstream source package name.
+    /// Package key → upstream source package name.
     pkg_to_src: HashMap<String, String>,
+    /// Package key → architecture; absent for `Architecture: all`.
+    pkg_to_arch: HashMap<String, String>,
 }
 
 impl DpkgIndex {
     fn load() -> Option<Self> {
-        let (pkg_to_version, pkg_to_src) = Self::load_versions().ok()?;
+        let (pkg_to_version, pkg_to_src, pkg_to_arch) = Self::load_versions().ok()?;
         let path_to_pkg = Self::load_paths().ok()?;
         log::debug!(
             "DpkgIndex: {} paths, {} packages, {} with upstream source",
@@ -119,56 +122,61 @@ impl DpkgIndex {
             pkg_to_version.len(),
             pkg_to_src.len(),
         );
-        Some(Self { path_to_pkg, pkg_to_version, pkg_to_src })
+        Some(Self { path_to_pkg, pkg_to_version, pkg_to_src, pkg_to_arch })
     }
 
-    fn load_versions() -> std::io::Result<(HashMap<String, String>, HashMap<String, String>)> {
+    /// Version, source and architecture of every package in dpkg's status
+    /// file, keyed the way dpkg names the package's `info/*.list` file: only a
+    /// `Multi-Arch: same` package is arch-qualified (`libc6:amd64.list`); any
+    /// other is bare (`gcc-13-x86-64-linux-gnu.list`), even when arch-specific.
+    fn load_versions() -> std::io::Result<(
+        HashMap<String, String>,
+        HashMap<String, String>,
+        HashMap<String, String>,
+    )> {
         let content = fs::read_to_string("/var/lib/dpkg/status")?;
         let mut versions: HashMap<String, String> = HashMap::new();
         let mut sources: HashMap<String, String> = HashMap::new();
+        let mut arches: HashMap<String, String> = HashMap::new();
 
         let mut pkg = String::new();
         let mut arch = String::new();
+        let mut multi_arch = String::new();
         let mut version = String::new();
         let mut source = String::new();
 
-        for line in content.lines() {
+        // The trailing empty line flushes the last stanza.
+        for line in content.lines().chain(std::iter::once("")) {
             if line.is_empty() {
                 if !pkg.is_empty() && !version.is_empty() {
-                    let key = if arch.is_empty() || arch == "all" {
-                        pkg.clone()
-                    } else {
+                    let key = if multi_arch == "same" {
                         format!("{}:{}", pkg, arch)
+                    } else {
+                        pkg.clone()
                     };
                     versions.insert(key.clone(), version.clone());
                     if !source.is_empty() && source != pkg {
-                        sources.insert(key, source.clone());
+                        sources.insert(key.clone(), source.clone());
+                    }
+                    if !arch.is_empty() && arch != "all" {
+                        arches.insert(key, arch.clone());
                     }
                 }
-                pkg.clear(); arch.clear(); version.clear(); source.clear();
+                pkg.clear(); arch.clear(); multi_arch.clear(); version.clear(); source.clear();
             } else if let Some(v) = line.strip_prefix("Package: ") {
                 pkg = v.to_string();
             } else if let Some(v) = line.strip_prefix("Architecture: ") {
                 arch = v.to_string();
+            } else if let Some(v) = line.strip_prefix("Multi-Arch: ") {
+                multi_arch = v.to_string();
             } else if let Some(v) = line.strip_prefix("Version: ") {
                 version = v.to_string();
             } else if let Some(v) = line.strip_prefix("Source: ") {
                 source = v.split_whitespace().next().unwrap_or(v).to_string();
             }
         }
-        if !pkg.is_empty() && !version.is_empty() {
-            let key = if arch.is_empty() || arch == "all" {
-                pkg.clone()
-            } else {
-                format!("{}:{}", pkg, arch)
-            };
-            versions.insert(key.clone(), version);
-            if !source.is_empty() && source != pkg {
-                sources.insert(key, source);
-            }
-        }
 
-        Ok((versions, sources))
+        Ok((versions, sources, arches))
     }
 
     fn load_paths() -> std::io::Result<HashMap<String, String>> {
@@ -227,9 +235,8 @@ impl DpkgIndex {
 
     fn lookup(&self, path: &str) -> Option<(String, String, Option<String>, Option<String>)> {
         let pkg_key = self.path_to_pkg.get(path)?;
-        let mut parts = pkg_key.splitn(2, ':');
-        let pkg_name = parts.next().unwrap_or(pkg_key).to_string();
-        let arch = parts.next().map(str::to_string);
+        let pkg_name = pkg_key.split(':').next().unwrap_or(pkg_key).to_string();
+        let arch = self.pkg_to_arch.get(pkg_key.as_str()).cloned();
         let version = self.pkg_to_version
             .get(pkg_key.as_str())
             .cloned()
@@ -711,7 +718,7 @@ impl IdentityEngine {
             (Some(n), v, u)
         } else {
             let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if filename.contains(".so") {
+            if super::resolver::is_shared_library_name(filename) {
                 let (name, version) = soname_name_version(path);
                 (name, version, None)
             } else {

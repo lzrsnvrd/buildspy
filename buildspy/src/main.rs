@@ -61,8 +61,11 @@ struct Cli {
     #[arg(long)]
     ecosystem_dev: bool,
 
-    /// Include file opens from build orchestrators (cmake, make, ninja, …).
-    /// By default these are filtered out because they are not project dependencies.
+    /// Include what the build tools open for themselves: file opens from build
+    /// orchestrators (cmake, make, ninja, …) and the toolchain's own runtime
+    /// libraries (cc1plus → libisl/libmpfr, ld → libbfd, cp → libselinux, GCC's
+    /// LTO plugin, …). By default these are filtered out because they are not
+    /// project dependencies.
     /// Use this flag to compare against tools that include toolchain/orchestrator files.
     #[arg(long)]
     include_orchestrators: bool,

@@ -3,6 +3,7 @@
 //! Tracepoints attached:
 //!  * `sched/sched_process_fork`      – propagates tracking to child processes.
 //!  * `sched/sched_process_exit`      – removes exited PIDs from the filter.
+//!  * `sched/sched_process_exec`      – tells user-space a tracked PID exec'd.
 //!  * `syscalls/sys_enter_open`       – captures open() calls (x86-64 only).
 //!  * `syscalls/sys_enter_openat`     – captures openat() calls.
 //!  * `syscalls/sys_enter_openat2`    – captures openat2() calls (Linux ≥ 5.6).
@@ -17,7 +18,7 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::debug;
 use aya_log_ebpf::info;
-use buildspy_common::{FileEvent, MAX_FILENAME_LEN, EVENT_KIND_FORK, EVENT_KIND_OPEN};
+use buildspy_common::{FileEvent, MAX_FILENAME_LEN, EVENT_KIND_EXEC, EVENT_KIND_FORK, EVENT_KIND_OPEN};
 
 // ---------------------------------------------------------------------------
 // Configurable tracepoint field offsets
@@ -112,10 +113,28 @@ unsafe fn try_fork(ctx: &TracePointContext) -> Result<u32, i64> {
             // Emit a fork event so user-space can immediately read
             // /proc/<child>/comm and /proc/<child>/cwd while the child is
             // guaranteed to be alive.
-            emit_fork_event(child_tgid);
+            emit_pid_event(child_tgid, EVENT_KIND_FORK);
         }
     }
     Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// sched_process_exec  –  a tracked process replaced its image
+//
+// User-space reads /proc/<pid>/comm and cwd when a PID is announced at fork,
+// i.e. before the child execs, so the comm it gets is the parent's.  A process
+// that make or `sh -c` exec'd in place (a compiler, a linker) would keep the
+// name `make`/`sh` and have all its opens dropped as an orchestrator's.  This
+// event makes user-space read the metadata again, after the new image is in.
+// ---------------------------------------------------------------------------
+#[tracepoint]
+pub fn sched_process_exec(_ctx: TracePointContext) -> u32 {
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if unsafe { PID_FILTER.get(&tgid) }.is_some() {
+        emit_pid_event(tgid, EVENT_KIND_EXEC);
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -183,14 +202,14 @@ unsafe fn emit_open_event(_ctx: &TracePointContext, filename_ptr: u64) -> Result
 }
 
 // ---------------------------------------------------------------------------
-// emit_fork_event  –  write a EVENT_KIND_FORK record into the ring buffer
+// emit_pid_event  –  write an EVENT_KIND_FORK / EVENT_KIND_EXEC record
 //
-// Called from sched_process_fork after a successful PID_FILTER insert.
-// User-space uses this signal to read /proc/<child>/comm and /proc/<child>/cwd
-// while the child is guaranteed to be alive (it hasn't run yet).
+// Called from sched_process_fork after a successful PID_FILTER insert, and
+// from sched_process_exec for a tracked PID.  User-space uses this signal to
+// read /proc/<pid>/comm and /proc/<pid>/cwd.
 // ---------------------------------------------------------------------------
 #[inline(always)]
-fn emit_fork_event(child_tgid: u32) {
+fn emit_pid_event(tgid: u32, kind: u8) {
     let Some(mut entry) = FILE_EVENTS.reserve::<FileEvent>(0) else {
         return;
     };
@@ -198,9 +217,9 @@ fn emit_fork_event(child_tgid: u32) {
     // All bytes must be written before submit — BPF verifier requires this to
     // prevent information leaks from uninitialized kernel memory.
     let event = unsafe { &mut *entry.as_mut_ptr() };
-    event.pid = child_tgid;
+    event.pid = tgid;
     event.filename_len = 0;
-    event.kind = EVENT_KIND_FORK;
+    event.kind = kind;
     event._pad = [0u8; 3];
     event.filename = [0u8; MAX_FILENAME_LEN];
     entry.submit(0);

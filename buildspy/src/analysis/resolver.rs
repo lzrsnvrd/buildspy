@@ -45,16 +45,14 @@ pub fn is_relevant(raw: &str) -> bool {
 
     // Keep only files with relevant extensions.
     // Versioned shared libraries (e.g. libssl.so.3, libfoo.so.1.2.3) have
-    // their last extension as a version number, so we check the whole filename
-    // for a ".so" component in addition to the last extension.
+    // their last extension as a version number, so they are matched by name.
     let path = Path::new(raw);
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
 
-    // Match `*.so` or `*.so.<version>` (e.g. libssl.so.3).
-    if filename.contains(".so") {
+    if is_shared_library_name(filename) {
         return true;
     }
 
@@ -62,6 +60,19 @@ pub fn is_relevant(raw: &str) -> bool {
         Some(ext) => RELEVANT_EXTENSIONS.contains(&ext),
         None => false,
     }
+}
+
+/// Returns `true` for `*.so` and `*.so.<version>` (`libssl.so.3`), but not
+/// for every name that merely contains `.so` — the loader's `ld.so.cache`,
+/// `ld.so.conf` and `ld.so.conf.d` are not libraries.
+pub fn is_shared_library_name(filename: &str) -> bool {
+    filename.match_indices(".so").any(|(at, _)| {
+        let rest = &filename[at + 3..];
+        rest.is_empty()
+            || rest
+                .strip_prefix('.')
+                .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+    })
 }
 
 /// Normalise a raw path string into a canonical `PathBuf`.
@@ -106,13 +117,29 @@ pub fn normalize(raw: &str, working_dir: &Path) -> PathBuf {
 /// alone: the linker opens the libraries they name by itself.
 pub fn library_symlink_target(path: &Path) -> Option<PathBuf> {
     let filename = path.file_name()?.to_str()?;
-    if !filename.contains(".so") {
+    if !is_shared_library_name(filename) {
         return None;
     }
     if !std::fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
         return None;
     }
     std::fs::canonicalize(path).ok()
+}
+
+/// Returns `true` if `opened` has the shape of a link input rather than of a
+/// library the dynamic loader maps into a running tool.
+///
+/// `-lfoo` makes the linker open the unversioned `libfoo.so`: a symlink the
+/// `-dev` package ships, or a linker script (`libc.so`, `libgcc_s.so`).  The
+/// loader opens sonames instead — `libisl.so.23`, or a regular file whose
+/// soname has no version, such as `libbfd-2.42-system.so`.
+pub fn is_link_input(opened: &Path) -> bool {
+    let unversioned = opened
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".so"));
+    let symlink = std::fs::symlink_metadata(opened).is_ok_and(|m| m.file_type().is_symlink());
+    unversioned && (symlink || super::deps::read_elf_header(opened).is_none())
 }
 
 /// Returns `true` if the path lives under a system prefix.
@@ -140,6 +167,18 @@ mod tests {
         assert!(is_relevant("/usr/include/openssl/ssl.h"));
         assert!(is_relevant("./build/libfoo.a"));
         assert!(is_relevant("src/main.cpp"));
+    }
+
+    #[test]
+    fn shared_library_names() {
+        assert!(is_shared_library_name("libfoo.so"));
+        assert!(is_shared_library_name("libssl.so.3"));
+        assert!(is_shared_library_name("libbfd-2.42-system.so"));
+        assert!(!is_shared_library_name("ld.so.cache"));
+        assert!(!is_shared_library_name("ld.so.conf"));
+        assert!(!is_shared_library_name("ld.so.conf.d"));
+        assert!(!is_shared_library_name("libfoo.sock"));
+        assert!(!is_relevant("/etc/ld.so.cache"));
     }
 
     #[test]

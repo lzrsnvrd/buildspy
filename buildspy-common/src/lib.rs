@@ -10,13 +10,17 @@ pub const EVENT_KIND_OPEN: u8 = 0;
 /// `FileEvent.kind` — a process-fork event from `sched_process_fork`.
 /// `filename` is unused; `pid` is the child TGID.
 pub const EVENT_KIND_FORK: u8 = 1;
+/// `FileEvent.kind` — an exec event from `sched_process_exec`.
+/// `filename` is unused; `pid` is the TGID that replaced its image.
+pub const EVENT_KIND_EXEC: u8 = 2;
 
 /// Event emitted by the eBPF tracepoints into the `FILE_EVENTS` ring buffer.
 ///
-/// Two kinds share the same layout:
+/// Three kinds share the same layout:
 /// * `EVENT_KIND_OPEN` — `pid` is the opener TGID, `filename[..filename_len]`
 ///   is the path passed to `open`/`openat`/`openat2`.
 /// * `EVENT_KIND_FORK` — `pid` is the child TGID, `filename_len` is 0.
+/// * `EVENT_KIND_EXEC` — `pid` is the exec'ing TGID, `filename_len` is 0.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FileEvent {
@@ -24,11 +28,11 @@ pub struct FileEvent {
     pub pid: u32,
     /// Number of valid bytes in `filename` (0 for fork events).
     pub filename_len: u32,
-    /// Event kind: `EVENT_KIND_OPEN` or `EVENT_KIND_FORK`.
+    /// Event kind: `EVENT_KIND_OPEN`, `EVENT_KIND_FORK` or `EVENT_KIND_EXEC`.
     pub kind: u8,
     /// Explicit padding to keep `filename` at a predictable offset.
     pub _pad: [u8; 3],
-    /// Path passed to open syscall; unused for fork events.
+    /// Path passed to open syscall; unused for fork and exec events.
     pub filename: [u8; MAX_FILENAME_LEN],
 }
 

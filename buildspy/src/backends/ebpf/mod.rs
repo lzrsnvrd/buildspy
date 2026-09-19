@@ -22,7 +22,7 @@ use aya::{
     programs::TracePoint,
     Ebpf, EbpfLoader,
 };
-use buildspy_common::{FileEvent, EVENT_KIND_FORK};
+use buildspy_common::{FileEvent, EVENT_KIND_EXEC, EVENT_KIND_FORK};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use super::TracingSession;
@@ -167,6 +167,13 @@ fn load(verbose: bool) -> Result<Ebpf> {
 
     attach_tracepoint(&mut bpf, "sched_process_fork", "sched", "sched_process_fork")?;
     attach_tracepoint(&mut bpf, "sched_process_exit", "sched", "sched_process_exit")?;
+    // Without exec events a process keeps the comm read at fork — its parent's.
+    if let Err(e) = attach_tracepoint(&mut bpf, "sched_process_exec", "sched", "sched_process_exec") {
+        log::warn!(
+            "sched_process_exec tracepoint unavailable: {e} — processes exec'd in place by \
+             make or sh keep their parent's name, and their opens may be dropped"
+        );
+    }
     attach_tracepoint(&mut bpf, "sys_enter_openat", "syscalls", "sys_enter_openat")?;
 
     // sys_enter_open: legacy open() syscall, x86-64 only (SYS_open = 2).
@@ -239,6 +246,9 @@ pub fn pid_filter_remove(bpf: &mut Ebpf, pid: u32) {
 ///   `PID_FILTER` insert.  The child is guaranteed alive at this point, so we
 ///   immediately notify `new_pid_tx`; main reads `/proc/<pid>/comm` and
 ///   `/proc/<pid>/cwd` while the child is still running.
+/// * `EVENT_KIND_EXEC` — a tracked process replaced its image.  Its PID is sent
+///   again, even if known, so main re-reads the comm and cwd the fork-time read
+///   got from the parent.
 /// * `EVENT_KIND_OPEN` (default) — a file-open event.  If the opener PID has
 ///   not been seen before (multi-core race: child ran before the fork tracepoint
 ///   fired), we lazily send it to `new_pid_tx` as well; the child is guaranteed
@@ -382,6 +392,7 @@ fn drain_ring_buf(
     known_pids: &mut HashSet<u32>,
 ) {
     let mut n_fork = 0u64;
+    let mut n_exec = 0u64;
     let mut n_open = 0u64;
 
     while let Some(item) = rb.next() {
@@ -400,6 +411,13 @@ fn drain_ring_buf(
             if known_pids.insert(event.pid) {
                 let _ = new_pid_tx.send(event.pid);
             }
+            continue;
+        }
+
+        if event.kind == EVENT_KIND_EXEC {
+            n_exec += 1;
+            known_pids.insert(event.pid);
+            let _ = new_pid_tx.send(event.pid);
             continue;
         }
 
@@ -427,7 +445,7 @@ fn drain_ring_buf(
         }
     }
 
-    if n_fork + n_open > 0 {
-        log::debug!("eBPF drain: {} fork + {} open events", n_fork, n_open);
+    if n_fork + n_exec + n_open > 0 {
+        log::debug!("eBPF drain: {n_fork} fork + {n_exec} exec + {n_open} open events");
     }
 }

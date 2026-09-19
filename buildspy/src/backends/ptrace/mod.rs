@@ -793,6 +793,12 @@ fn ptrace_loop(
                         // syscall and its exit stop will never arrive.  Clear the state so
                         // the first syscall in the new image is treated as an entry stop.
                         in_syscall.remove(&pid_u32);
+                        // Announce the PID again so main re-reads its comm and
+                        // cwd: the first read ran at fork, before this exec, and
+                        // named the parent — `make`/`sh` for a compiler that
+                        // make or `sh -c` exec'd in place, whose opens would all
+                        // be dropped as an orchestrator's.
+                        let _ = new_pid_tx.send(pid_u32);
                     }
 
                     // SECCOMP=7 — an open call caught by the filter (Seccomp
