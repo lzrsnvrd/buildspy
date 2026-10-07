@@ -1,0 +1,9 @@
+/target
+/buildspy-ebpf/target
+/test_atomic
+/report.json
+/report.cdx.json
+*.swp
+.env
+.claude
+.git

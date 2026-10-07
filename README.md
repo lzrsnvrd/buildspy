@@ -32,6 +32,42 @@ cargo build --release -p buildspy
 
 The binary is at `target/release/buildspy`.
 
+### Docker
+
+No local install needed: `Dockerfile` builds `buildspy` and packages it with a
+C/C++ toolchain (`build-essential`, `cmake`, `ninja`, `git`).
+
+```bash
+docker build -t buildspy .
+```
+
+Run it against a project bind-mounted into the container. The `ptrace` backend
+only needs `CAP_SYS_PTRACE` and works on any host kernel:
+
+```bash
+docker run --rm -it \
+  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+  -v "$PWD":/workspace -w /workspace \
+  buildspy --backend ptrace -- cmake --build build
+```
+
+The `eBPF` backend needs the `bpf()` syscall, which Docker's default seccomp
+profile blocks outright regardless of capabilities — run `--privileged`
+instead, or a narrower `--cap-add=BPF --cap-add=PERFMON --security-opt
+seccomp=unconfined` on Docker 20.10+:
+
+```bash
+docker run --rm -it --privileged \
+  -v "$PWD":/workspace -w /workspace \
+  buildspy --backend ebpf -- cmake --build build
+```
+
+`report.json` is written under `/workspace` (i.e. into your bind-mounted
+project directory) unless `--output` points elsewhere. Tracing a build for a
+different ecosystem (Rust, Node, Go, …) needs that ecosystem's toolchain too —
+extend the image (`FROM buildspy`) and `apt-get install` it, rather than
+bundling every ecosystem by default.
+
 ## Usage
 
 ```bash
